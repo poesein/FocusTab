@@ -133,6 +133,143 @@ function Timer({ session, now }) {
     </span>
   );
 }
+
+function formatWait(seconds) {
+  if (seconds < 60) return `${seconds} 秒`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
+  return `${Math.floor(seconds / 3600)} 小时 ${Math.floor((seconds % 3600) / 60)} 分`;
+}
+
+function detectionDisplay(state, now, receivedAt, automatic, judgmentLabels) {
+  const status = typeof state.status === 'object' && state.status ? state.status : {};
+  const nextCheckAt =
+    Number.isFinite(status.nextCheckAt) &&
+    status.nextCheckAt > 0 &&
+    Number.isFinite(new Date(status.nextCheckAt).getTime())
+      ? status.nextCheckAt
+      : null;
+  const fallbackDeadline =
+    Number.isFinite(status.waitSeconds) && status.waitSeconds > 0
+      ? receivedAt + status.waitSeconds * 1000
+      : null;
+  const deadline = nextCheckAt || fallbackDeadline;
+  const seconds = deadline ? Math.max(0, Math.ceil((deadline - now) / 1000)) : null;
+  let label;
+  if (state.checking || status.code === 'checking') {
+    label = automatic ? '正在判断工作 / 学习与娱乐…' : '正在对照研究目标…';
+  } else {
+    const waiting =
+      seconds === null ? '' : seconds > 0 ? ` · 还需 ${formatWait(seconds)}` : ' · 等待后台复查';
+    const statuses = {
+      disabled: 'AI 内容判断已关闭',
+      'waiting-task': '填写研究目标后开始判断',
+      'no-page': state.diagnostics?.eligible === false ? '暂未满足判断条件' : '等待识别普通网页',
+      excluded: '此页面不参与 AI 判断',
+      dwelling: '等待页面稳定停留' + waiting,
+      interval: '等待 NAS 请求间隔' + waiting,
+      'hour-limit': '本小时 AI 请求额度已用完' + waiting,
+      ready: '已满足条件，等待后台自动检查',
+      error:
+        'AI 请求失败' + (seconds !== null && seconds > 0 ? ` · ${formatWait(seconds)}后重试` : ''),
+      judged: state.judgment ? judgmentLabels[state.judgment.label] : '已判断当前网页',
+    };
+    label = statuses[status.code];
+    if (!label) {
+      label = state.judgment
+        ? judgmentLabels[state.judgment.label]
+        : state.diagnostics?.eligible === false
+        ? '暂未满足判断条件'
+        : !state.current
+        ? '等待识别普通网页'
+        : typeof state.status === 'string'
+        ? state.status
+        : status.message || '等待后台检查状态';
+    }
+  }
+  return { label, nextCheckAt, seconds };
+}
+
+function validPassBudget(budget) {
+  if (!budget || typeof budget !== 'object' || Array.isArray(budget)) return false;
+  const integer = (value, min, max = Number.MAX_SAFE_INTEGER) =>
+    Number.isSafeInteger(value) && value >= min && value <= max;
+  const timestamp = (value) =>
+    Number.isFinite(value) && value >= 0 && Number.isFinite(new Date(value).getTime());
+  if (
+    typeof budget.enabled !== 'boolean' ||
+    typeof budget.canGrant !== 'boolean' ||
+    !integer(budget.dailyLimitMinutes, 0, 180) ||
+    !integer(budget.usedMinutes, 0) ||
+    !integer(budget.cooldownMinutes, 0, 120) ||
+    !timestamp(budget.cooldownUntil) ||
+    !integer(budget.grantMinutes, 0, 30)
+  )
+    return false;
+  if (
+    budget.dailyLimitMinutes === 0
+      ? budget.remainingMinutes !== null
+      : budget.remainingMinutes !== Math.max(0, budget.dailyLimitMinutes - budget.usedMinutes)
+  )
+    return false;
+  if (
+    budget.canGrant &&
+    (!budget.enabled ||
+      budget.grantMinutes < 1 ||
+      (budget.remainingMinutes !== null && budget.grantMinutes > budget.remainingMinutes))
+  )
+    return false;
+  // Older complete budgets may omit display-only scheduling and reason fields.
+  if (budget.waitSeconds !== undefined && !integer(budget.waitSeconds, 0)) return false;
+  if (
+    budget.nextAvailableAt !== undefined &&
+    budget.nextAvailableAt !== null &&
+    !timestamp(budget.nextAvailableAt)
+  )
+    return false;
+  return budget.reason === undefined || typeof budget.reason === 'string';
+}
+
+function PassBudgetInfo({ budget, now, reused }) {
+  if (!budget) return <p class="fine">正在读取今日放行额度…</p>;
+  const cooldown = Number.isFinite(budget.cooldownUntil)
+    ? Math.max(0, Math.ceil((budget.cooldownUntil - now) / 1000))
+    : 0;
+  return (
+    <section class="pass-budget fine" aria-label="临时放行额度">
+      <p>
+        {budget.dailyLimitMinutes === 0
+          ? `今日已获批 ${budget.usedMinutes} 分钟 · 不设每日累计上限`
+          : `今日已获批 ${budget.usedMinutes} 分钟 · 剩余 ${budget.remainingMinutes} / ${budget.dailyLimitMinutes} 分钟`}
+      </p>
+      {cooldown > 0 && (
+        <p class="pass-countdown" role="timer" aria-live="off">
+          距再次放行还需 {formatWait(cooldown)}
+        </p>
+      )}
+      {!reused && budget.reason && <p>{budget.reason}</p>}
+      {!reused && !budget.canGrant && cooldown === 0 && budget.remainingMinutes !== 0 && (
+        <p>正在核验最新放行额度…</p>
+      )}
+      {Number.isFinite(budget.nextAvailableAt) && budget.nextAvailableAt > now && (
+        <p>
+          下次可申请：
+          <time dateTime={new Date(budget.nextAvailableAt).toISOString()}>
+            {new Date(budget.nextAvailableAt).toLocaleString('zh-CN', {
+              month: 'numeric',
+              day: 'numeric',
+              hour: '2-digit',
+              minute: '2-digit',
+              second: '2-digit',
+              hour12: false,
+            })}
+          </time>
+        </p>
+      )}
+      {reused && <p>沿用当前放行截止时间，不会重新扣减额度或延长。</p>}
+    </section>
+  );
+}
+
 function App() {
   const [state, setState] = useState(null),
     [error, setError] = useState(''),
@@ -148,7 +285,9 @@ function App() {
   const [goal, setGoal] = useState(''),
     [remember, setRemember] = useState(false),
     [blocked, setBlocked] = useState(null);
-  const input = useRef();
+  const input = useRef(),
+    snapshotClock = useRef({ state: null, receivedAt: Date.now() });
+  const passRefreshAt = useRef(null);
   async function refresh() {
     try {
       setState(await request('state'));
@@ -156,11 +295,23 @@ function App() {
       setError(e.message);
     }
   }
+  async function refreshBlocked() {
+    if (page !== 'blocked' || !isExtension) return;
+    try {
+      setBlocked(await request('blocked', blockedPayload(location.hash)));
+    } catch (e) {
+      setBlocked(null);
+      setError(e.message);
+    }
+  }
   useEffect(() => {
     refresh();
-    const timer = setInterval(() => {
-      setNow(Date.now());
+    // The visible countdown is local. Keep the existing state refresh cadence;
+    // displaying a second ticking down must never request an AI check.
+    const clockTimer = setInterval(() => setNow(Date.now()), 1000);
+    const stateTimer = setInterval(() => {
       if (page === 'popup' && !document.hidden) refresh();
+      if (page === 'blocked' && !document.hidden) refreshBlocked();
     }, 2000);
     const changed = () => {
       if (page === 'popup') {
@@ -170,7 +321,10 @@ function App() {
             document.hasFocus()
         ).catch(() => {});
       }
-      if (!document.hidden) refresh();
+      if (!document.hidden) {
+        refresh();
+        refreshBlocked();
+      }
     };
     document.addEventListener('visibilitychange', changed);
     const focused = () => {
@@ -201,7 +355,8 @@ function App() {
     };
     document.addEventListener('keydown', key);
     return () => {
-      clearInterval(timer);
+      clearInterval(clockTimer);
+      clearInterval(stateTimer);
       document.removeEventListener('visibilitychange', changed);
       window.removeEventListener('focus', focused);
       window.removeEventListener('blur', blurred);
@@ -217,11 +372,31 @@ function App() {
     document.documentElement.dataset.theme = state.config.theme;
   }, [state?.config]);
   useEffect(() => {
-    if (page !== 'blocked' || !isExtension) return;
-    request('blocked', blockedPayload(location.hash))
-      .then(setBlocked)
-      .catch((e) => setError(e.message));
+    refreshBlocked();
   }, []);
+  const blockedBudget = validPassBudget(blocked?.passBudget) ? blocked.passBudget : null;
+  const snapshotBudget = validPassBudget(state?.passBudget) ? state.passBudget : null;
+  const waitingPassBudget = blockedBudget || snapshotBudget;
+  const nextPassAt =
+    waitingPassBudget?.enabled === true &&
+    waitingPassBudget.canGrant === false &&
+    blocked?.canPass !== true
+      ? waitingPassBudget.nextAvailableAt
+      : null;
+  useEffect(() => {
+    // Reaching zero only asks the backend again; the local clock never grants
+    // a pass or resets the shared daily budget.
+    if (
+      page !== 'blocked' ||
+      !Number.isFinite(nextPassAt) ||
+      nextPassAt <= 0 ||
+      nextPassAt > now ||
+      passRefreshAt.current === nextPassAt
+    )
+      return;
+    passRefreshAt.current = nextPassAt;
+    refreshBlocked();
+  }, [now, nextPassAt]);
   async function act(type, payload = {}, bubbleError = false) {
     setBusy(true);
     setError('');
@@ -278,6 +453,39 @@ function App() {
   const judgmentLabels = automatic
     ? { ...labels, related: '工作或学习', unrelated: '娱乐或消遣' }
     : labels;
+  if (snapshotClock.current.state !== state) {
+    snapshotClock.current = { state, receivedAt: Date.now() };
+  }
+  const detection = detectionDisplay(
+    state,
+    now,
+    snapshotClock.current.receivedAt,
+    automatic,
+    judgmentLabels
+  );
+  const passBudget = blockedBudget || snapshotBudget;
+  const passEnabled =
+    config.temporaryPassEnabled !== false &&
+    blocked?.passBudget?.enabled !== false &&
+    state.passBudget?.enabled !== false;
+  const candidateMinutes = blocked?.minutes ?? blockedBudget?.grantMinutes;
+  const validMinutes =
+    Number.isInteger(candidateMinutes) && candidateMinutes >= 1 && candidateMinutes <= 30;
+  const existingLease =
+    blocked?.minutes === 0 &&
+    Number.isFinite(blocked.until) &&
+    Number.isFinite(new Date(blocked.until).getTime()) &&
+    blocked.until > now;
+  const canPass = Boolean(
+    passEnabled &&
+      blockedBudget?.enabled === true &&
+      blocked?.canPass === true &&
+      (existingLease ||
+        (validMinutes &&
+          (blockedBudget.canGrant === false || candidateMinutes <= blockedBudget.grantMinutes)))
+  );
+  const reusedPass = Boolean(canPass && (existingLease || passBudget?.canGrant === false));
+  const grantMinutes = blockedBudget && validMinutes ? candidateMinutes : 0;
   const checkStatus = typeof state.status === 'string' ? state.status : state.status?.message;
   const task = (
     <div class="task-card">
@@ -365,27 +573,48 @@ function App() {
           <a class="button" href="index.html">
             回到搜索 <Icon name="arrow" size={17} />
           </a>
-          <Button
-            secondary
-            disabled={busy || !blocked}
-            onClick={() => act('pass', blockedPayload(location.hash))}
-          >
-            仅此页放行 {blocked?.minutes || config.allowMinutes} 分钟
-          </Button>
+          <a class="button secondary" href="https://weread.qq.com/" rel="noreferrer">
+            看会书吧
+          </a>
+          {passEnabled && (
+            <Button
+              secondary
+              disabled={busy || !canPass}
+              onClick={async () => {
+                if (!(await act('pass', blockedPayload(location.hash)))) await refreshBlocked();
+              }}
+            >
+              {reusedPass
+                ? '返回已放行页面'
+                : grantMinutes > 0
+                ? `仅此页放行 ${grantMinutes} 分钟`
+                : '暂不可临时放行'}
+            </Button>
+          )}
         </div>
+        {passEnabled && <PassBudgetInfo budget={passBudget} now={now} reused={reusedPass} />}
+        {passEnabled && blocked && (!blockedBudget || typeof blocked.canPass !== 'boolean') && (
+          <p class="fine" role="status">
+            尚未获得有效放行额度，暂不可放行。
+          </p>
+        )}
         {location.hash === '#ai' && (
           <button
             class="text-button"
             disabled={busy || !blocked || !hasContext}
             onClick={async () => {
               if (await act('feedback', { label: 'related', remember: false, ai: true }))
-                setNotice('已纠正本次判断；当前页面仍保持拦截，可单独选择短时放行。');
+                setNotice('已纠正；重新打开原网址时使用本次纠正。');
             }}
           >
             {automatic ? '这页属于工作或学习，纠正判断' : '这页与研究相关，纠正判断'}
           </button>
         )}
-        <p class="fine">放行只适用于当前标签页的这个网址，到期恢复拦截。</p>
+        {passEnabled && (
+          <p class="fine">
+            放行只适用于当前标签页的这个网址，到期恢复拦截。每日额度按获批时长扣减，提前关页不退回。
+          </p>
+        )}
         {alerts}
         <button class="text-button" onClick={() => openSettings('blocking')}>
           调整拦截规则
@@ -418,25 +647,13 @@ function App() {
           <span class="eyebrow">当前页面</span>
           <h2>{state.current?.title || '当前没有可判断的普通网页'}</h2>
           <p class="site">{state.current?.url || '只在前台、非隐私窗口内判断'}</p>
-          <div class={`judgment ${judgment?.label || ''}`}>
+          <div
+            class={`judgment ${
+              !state.status?.code || state.status.code === 'judged' ? judgment?.label || '' : ''
+            }`}
+          >
             <Icon name="shield" size={18} />
-            <span>
-              {state.checking
-                ? automatic
-                  ? '正在判断工作 / 学习与娱乐…'
-                  : '正在对照研究目标…'
-                : judgment
-                ? judgmentLabels[judgment.label]
-                : state.diagnostics?.eligible === false
-                ? '暂未满足判断条件'
-                : !state.current
-                ? '等待识别普通网页'
-                : config.autoClassify
-                ? '等待页面稳定停留'
-                : activeSession
-                ? '等待资料页稳定停留'
-                : '填写研究目标后开始判断'}
-            </span>
+            <span>{detection.label}</span>
           </div>
           {judgment && (
             <>
@@ -497,6 +714,19 @@ function App() {
             本小时 AI 请求 {state.calls || 0} / {config.requestsPerHour}
           </p>
           <p>页面状态：{state.diagnostics?.code || state.status?.code || '等待检测'}</p>
+          <p class="next-check">
+            下一次自动检查：
+            {detection.nextCheckAt ? (
+              <time dateTime={new Date(detection.nextCheckAt).toISOString()}>
+                {new Date(detection.nextCheckAt).toLocaleTimeString('zh-CN', { hour12: false })}
+              </time>
+            ) : state.checking || state.status?.code === 'checking' ? (
+              '当前请求进行中'
+            ) : (
+              '等待满足判断条件'
+            )}
+          </p>
+          <p class="fine">自动检查由后台调度，无需保持此弹窗打开。</p>
           {state.diagnostics?.checkedAt && (
             <p>检测时间：{new Date(state.diagnostics.checkedAt).toLocaleTimeString('zh-CN')}</p>
           )}
@@ -754,13 +984,14 @@ function Settings({ config, section, setSection, onClose, save, act, state }) {
       <input value={draft[key]} maxLength={200} onInput={(e) => set(key, e.target.value)} />
     </Field>
   );
-  const numeric = (key, label, min, max, help) => (
+  const numeric = (key, label, min, max, help, disabled = false) => (
     <Field label={label} help={help}>
       <input
         type="number"
         min={min}
         max={max}
         step={key === 'threshold' ? '0.01' : '1'}
+        disabled={disabled}
         value={draft[key]}
         onInput={(e) => set(key, e.target.value === '' ? '' : Number(e.target.value))}
       />
@@ -982,7 +1213,12 @@ function Settings({ config, section, setSection, onClose, save, act, state }) {
                     {numeric('excerptChars', '正文摘录上限（字符）', 300, 4000)}
                     {select('aiAction', '明确娱乐或偏离目标时', [
                       ['remind', '提醒，保留当前页面'],
-                      ['block', '高置信度时拦截，保留短时放行入口'],
+                      [
+                        'block',
+                        draft.temporaryPassEnabled === false
+                          ? '高置信度时拦截'
+                          : '高置信度时拦截，保留短时放行入口',
+                      ],
                     ])}
                     {numeric(
                       'threshold',
@@ -1063,13 +1299,37 @@ function Settings({ config, section, setSection, onClose, save, act, state }) {
                     ))}
                   </div>
                   <div class="settings-card">
+                    {toggle(
+                      'temporaryPassEnabled',
+                      '允许临时放行',
+                      '关闭并保存后，拦截页不再显示放行入口，已有放行也会立即撤销。'
+                    )}
                     {numeric(
                       'allowMinutes',
                       '被拦截页面临时放行（分钟）',
                       1,
                       30,
-                      '只放行当前标签页的精确网址。到期恢复拦截，其他页面仍受原规则保护。'
+                      '只放行当前标签页的精确网址。到期恢复拦截，其他页面仍受原规则保护。',
+                      draft.temporaryPassEnabled === false
                     )}
+                    <div class="form-grid">
+                      {numeric(
+                        'passDailyMinutes',
+                        '每日累计放行上限（分钟）',
+                        0,
+                        180,
+                        '0 表示不限。按获批时长扣减，提前关页不退回；所有网站和标签页共享。',
+                        draft.temporaryPassEnabled === false
+                      )}
+                      {numeric(
+                        'passCooldownMinutes',
+                        '再次放行冷却（分钟）',
+                        0,
+                        120,
+                        '0 表示关闭。当前放行结束后，再等待此时长才能申请下一次；跨网站共享。',
+                        draft.temporaryPassEnabled === false
+                      )}
+                    </div>
                     <h3>自定义网址规则</h3>
                     <RuleEditor
                       items={draft.customRules}

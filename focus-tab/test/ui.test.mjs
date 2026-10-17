@@ -87,16 +87,33 @@ function extensionMock(window, state, calls) {
       getURL: (path) => `chrome-extension://focus-ui-test/${path}`,
       async sendMessage(message) {
         calls.push(JSON.parse(JSON.stringify(message)));
+        const passBudget = state.passBudget || {
+          enabled: state.config.temporaryPassEnabled !== false,
+          dailyLimitMinutes: 20,
+          usedMinutes: 0,
+          remainingMinutes: 20,
+          cooldownMinutes: 10,
+          cooldownUntil: 0,
+          waitSeconds: 0,
+          nextAvailableAt: null,
+          canGrant: state.config.temporaryPassEnabled !== false,
+          grantMinutes: 10,
+          reason: '',
+        };
         return {
           ok: true,
           data:
             message.type === 'focus:blocked'
-              ? {
-                  url: 'https://www.bilibili.com/video/BVresearch',
-                  reason: '待纠正的 AI 判断',
-                  minutes: 10,
-                  ai: true,
-                }
+              ? structuredClone(
+                  state.blockedResponse || {
+                    url: 'https://www.bilibili.com/video/BVresearch',
+                    reason: '待纠正的 AI 判断',
+                    ai: true,
+                    passBudget,
+                    canPass: passBudget.canGrant,
+                    minutes: passBudget.grantMinutes,
+                  }
+                )
               : structuredClone(state),
         };
       },
@@ -294,7 +311,7 @@ test('AI blocked-page correction submits feedback without silently granting a pa
     const { document } = dom.window;
     await until(() => !button(document, '这页与研究相关，纠正判断')?.disabled, 'loaded AI block');
     button(document, '这页与研究相关，纠正判断').click();
-    await until(() => document.querySelector('.toast')?.textContent.includes('已纠正本次判断'));
+    await until(() => document.querySelector('.toast')?.textContent.includes('已纠正'));
     assert.deepEqual(calls.find((call) => call.type === 'focus:feedback')?.payload, {
       label: 'related',
       remember: false,
@@ -354,7 +371,7 @@ test('automatic popup allows checking and correcting without a research task and
   try {
     const { document } = dom.window;
     assert.match(document.querySelector('.task-card').textContent, /研究目标可选填/);
-    assert.match(document.querySelector('.judgment').textContent, /等待页面稳定停留/);
+    assert.match(document.querySelector('.judgment').textContent, /AI 请求失败/);
     assert.equal(button(document, '检查当前页面').disabled, false);
     assert.equal(button(document, '工作或学习').disabled, false);
     assert.equal(button(document, '娱乐消遣').disabled, false);
@@ -797,6 +814,745 @@ test('a popup blur while its owner lookup is pending cannot renew a stale focuse
   try {
     assert.ok(calls.some((call) => call.type === 'focus:ui-state'));
     assert.ok(calls.every((call) => call.uiFocus?.focused === false));
+  } finally {
+    dom.window.disposeUI();
+    dom.window.close();
+  }
+});
+
+test('popup counts down the NAS interval locally and shows its automatic deadline without AI requests', async () => {
+  let instant = 1_800_000_000_000;
+  const timers = [],
+    calls = [],
+    nextCheckAt = instant + 90_000;
+  const state = {
+    config: structuredClone(DEFAULTS),
+    session: null,
+    current: { title: '研究教程', url: 'https://www.bilibili.com/video/BVresearch' },
+    judgment: null,
+    checking: false,
+    feedback: [],
+    diagnostics: { eligible: true },
+    status: {
+      mode: 'auto',
+      code: 'interval',
+      message: '正在等待 NAS 请求间隔，后台会自动检查。',
+      waitSeconds: 90,
+      nextCheckAt,
+    },
+  };
+  const dom = await mount({
+    page: 'popup',
+    setup(window) {
+      extensionMock(window, state, calls);
+      window.Date.now = () => instant;
+      window.setInterval = (callback, delay) => {
+        timers.push({ callback, delay });
+        return timers.length;
+      };
+      window.clearInterval = () => {};
+    },
+  });
+  try {
+    const { document } = dom.window;
+    assert.match(document.querySelector('.judgment').textContent, /NAS 请求间隔.*1 分 30 秒/);
+    assert.equal(
+      document.querySelector('.next-check time').dateTime,
+      new Date(nextCheckAt).toISOString()
+    );
+    const before = calls.length;
+    instant += 31_000;
+    timers.find((timer) => timer.delay === 1000).callback();
+    await until(() => document.querySelector('.judgment').textContent.includes('59 秒'));
+    assert.equal(calls.length, before, 'the local countdown must not poll state or call AI');
+    assert.equal(
+      calls.some((call) => call.type === 'focus:check'),
+      false
+    );
+    assert.equal(
+      document.querySelector('.next-check time').dateTime,
+      new Date(nextCheckAt).toISOString()
+    );
+    instant += 120_000;
+    timers.find((timer) => timer.delay === 1000).callback();
+    await until(() => document.querySelector('.judgment').textContent.includes('等待后台复查'));
+    assert.doesNotMatch(document.querySelector('.judgment').textContent, /-\d+ 秒/);
+    assert.equal(calls.length, before);
+  } finally {
+    dom.window.disposeUI();
+    dom.window.close();
+  }
+});
+
+test('hourly quota, excluded pages and disabled AI do not pretend to be waiting for page dwell', async () => {
+  const instant = 1_800_000_000_000;
+  for (const item of [
+    {
+      code: 'hour-limit',
+      pattern: /本小时 AI 请求额度已用完.*1 小时 0 分/,
+      wait: 3601,
+      aiEnabled: true,
+    },
+    { code: 'excluded', pattern: /不参与 AI 判断/, wait: 0, aiEnabled: true },
+    { code: 'disabled', pattern: /AI 内容判断已关闭/, wait: 0, aiEnabled: false },
+    { code: 'ready', pattern: /等待后台自动检查/, wait: 0, aiEnabled: true },
+    { code: 'dwelling', pattern: /等待页面稳定停留.*20 秒/, wait: 20, aiEnabled: true },
+    { code: 'checking', pattern: /正在判断工作/, wait: 0, aiEnabled: true },
+  ]) {
+    const calls = [],
+      state = {
+        config: { ...structuredClone(DEFAULTS), aiEnabled: item.aiEnabled },
+        session: null,
+        current: { title: '页面', url: 'https://www.bilibili.com/video/BVresearch' },
+        judgment: { label: 'related', reason: '旧的判断', confidence: 0.9 },
+        checking: item.code === 'checking',
+        feedback: [],
+        status: {
+          mode: 'auto',
+          code: item.code,
+          message: '当前真实检测状态',
+          waitSeconds: item.wait,
+          nextCheckAt: item.wait ? instant + item.wait * 1000 : null,
+        },
+      };
+    const dom = await mount({
+      page: 'popup',
+      setup(window) {
+        extensionMock(window, state, calls);
+        window.Date.now = () => instant;
+      },
+    });
+    try {
+      assert.match(dom.window.document.querySelector('.judgment').textContent, item.pattern);
+      if (['excluded', 'disabled'].includes(item.code)) {
+        assert.equal(button(dom.window.document, '检查当前页面').disabled, true);
+      }
+      assert.equal(
+        calls.some((call) => call.type === 'focus:check'),
+        false
+      );
+    } finally {
+      dom.window.disposeUI();
+      dom.window.close();
+    }
+  }
+});
+
+test('older status snapshots with waitSeconds still count down without inventing a precise next-check timestamp', async () => {
+  let instant = 1_800_000_000_000;
+  const timers = [],
+    state = {
+      config: structuredClone(DEFAULTS),
+      session: null,
+      current: { title: '页面', url: 'https://www.bilibili.com/video/BVresearch' },
+      judgment: null,
+      checking: false,
+      feedback: [],
+      status: { mode: 'auto', code: 'dwelling', message: '停留片刻后自动判断', waitSeconds: 20 },
+    };
+  const dom = await mount({
+    page: 'popup',
+    setup(window) {
+      extensionMock(window, state, []);
+      window.Date.now = () => instant;
+      window.setInterval = (callback, delay) => {
+        timers.push({ callback, delay });
+        return timers.length;
+      };
+      window.clearInterval = () => {};
+    },
+  });
+  try {
+    assert.match(dom.window.document.querySelector('.judgment').textContent, /20 秒/);
+    assert.equal(dom.window.document.querySelector('.next-check time'), null);
+    instant += 6_000;
+    timers.find((timer) => timer.delay === 1000).callback();
+    await until(() => dom.window.document.querySelector('.judgment').textContent.includes('14 秒'));
+  } finally {
+    dom.window.disposeUI();
+    dom.window.close();
+  }
+});
+
+test('disabled temporary passes disappear completely while reading and correction remain available', async () => {
+  const calls = [],
+    state = {
+      config: { ...structuredClone(DEFAULTS), temporaryPassEnabled: false },
+      session: null,
+      current: null,
+      judgment: null,
+      checking: false,
+      feedback: [],
+      passBudget: {
+        enabled: false,
+        dailyLimitMinutes: 20,
+        usedMinutes: 10,
+        remainingMinutes: 10,
+        cooldownMinutes: 10,
+        cooldownUntil: 0,
+        waitSeconds: 0,
+        nextAvailableAt: null,
+        canGrant: false,
+        grantMinutes: 0,
+        reason: '已关闭临时放行',
+      },
+    };
+  const dom = await mount({
+    page: 'blocked',
+    hash: '#ai',
+    setup(window) {
+      extensionMock(window, state, calls);
+    },
+  });
+  try {
+    const { document } = dom.window;
+    await until(
+      () =>
+        button(document, '这页属于工作或学习，纠正判断') &&
+        !button(document, '这页属于工作或学习，纠正判断').disabled
+    );
+    assert.equal([...document.querySelectorAll('.blocked-actions button')].length, 0);
+    assert.equal(document.querySelector('.pass-budget'), null);
+    assert.doesNotMatch(document.querySelector('.blocked-page').textContent, /放行/);
+    const reading = [...document.querySelectorAll('.blocked-actions a')].find(
+      (link) => link.textContent.trim() === '看会书吧'
+    );
+    assert.equal(reading.href, 'https://weread.qq.com/');
+    assert.equal(reading.getAttribute('target'), null, 'reading opens in the current tab');
+    assert.equal(reading.rel, 'noreferrer');
+    button(document, '这页属于工作或学习，纠正判断').click();
+    await until(() => document.querySelector('.toast').textContent.includes('已纠正'));
+    assert.match(document.querySelector('.toast').textContent, /重新打开原网址/);
+    assert.doesNotMatch(document.querySelector('.toast').textContent, /放行/);
+    assert.equal(
+      calls.some((call) => call.type === 'focus:pass'),
+      false
+    );
+  } finally {
+    dom.window.disposeUI();
+    dom.window.close();
+  }
+});
+
+test('the blocked page uses the final backend decision and actual granted minutes', async () => {
+  const timers = [],
+    calls = [],
+    budget = {
+      enabled: true,
+      dailyLimitMinutes: 20,
+      usedMinutes: 15,
+      remainingMinutes: 5,
+      cooldownMinutes: 10,
+      cooldownUntil: 0,
+      waitSeconds: 0,
+      nextAvailableAt: null,
+      canGrant: true,
+      grantMinutes: 5,
+      reason: '',
+    };
+  const state = {
+    config: structuredClone(DEFAULTS),
+    session: null,
+    current: null,
+    judgment: null,
+    checking: false,
+    feedback: [],
+    passBudget: budget,
+    blockedResponse: {
+      url: 'https://www.bilibili.com/',
+      reason: '推荐入口',
+      minutes: 5,
+      canPass: false,
+      passBudget: budget,
+    },
+  };
+  const dom = await mount({
+    page: 'blocked',
+    hash: '#https%3A%2F%2Fwww.bilibili.com%2F',
+    setup(window) {
+      extensionMock(window, state, calls);
+      window.setInterval = (callback, delay) => {
+        timers.push({ callback, delay });
+        return timers.length;
+      };
+      window.clearInterval = () => {};
+    },
+  });
+  try {
+    const { document } = dom.window;
+    await until(() =>
+      document.querySelector('.pass-budget')?.textContent.includes('剩余 5 / 20 分钟')
+    );
+    const pass = button(document, '仅此页放行 5 分钟');
+    assert.equal(pass.disabled, true, 'budget availability cannot override blocked.canPass=false');
+    pass.click();
+    assert.equal(
+      calls.some((call) => call.type === 'focus:pass'),
+      false
+    );
+    state.blockedResponse.canPass = true;
+    timers.find((timer) => timer.delay === 2000).callback();
+    await until(() => !button(document, '仅此页放行 5 分钟').disabled);
+    button(document, '仅此页放行 5 分钟').click();
+    await until(() => calls.some((call) => call.type === 'focus:pass'));
+    assert.equal(calls.filter((call) => call.type === 'focus:pass').length, 1);
+    assert.match(
+      document.querySelector('.blocked-page').textContent,
+      /按获批时长扣减，提前关页不退回/
+    );
+    assert.equal(
+      calls.some((call) => call.type === 'focus:check'),
+      false
+    );
+  } finally {
+    dom.window.disposeUI();
+    dom.window.close();
+  }
+});
+
+test('cooldown counts down locally and expiry only rechecks the backend before enabling a pass', async () => {
+  let instant = 1_800_000_000_000;
+  const timers = [],
+    calls = [],
+    budget = {
+      enabled: true,
+      dailyLimitMinutes: 20,
+      usedMinutes: 10,
+      remainingMinutes: 10,
+      cooldownMinutes: 10,
+      cooldownUntil: instant + 10_000,
+      waitSeconds: 10,
+      nextAvailableAt: instant + 10_000,
+      canGrant: false,
+      grantMinutes: 10,
+      reason: '再次放行仍在冷却中',
+    };
+  const state = {
+    config: structuredClone(DEFAULTS),
+    session: null,
+    current: null,
+    judgment: null,
+    checking: false,
+    feedback: [],
+    passBudget: budget,
+  };
+  const dom = await mount({
+    page: 'blocked',
+    hash: '#ai',
+    setup(window) {
+      extensionMock(window, state, calls);
+      window.Date.now = () => instant;
+      window.setInterval = (callback, delay) => {
+        timers.push({ callback, delay });
+        return timers.length;
+      };
+      window.clearInterval = () => {};
+    },
+  });
+  try {
+    const { document } = dom.window;
+    await until(() => document.querySelector('.pass-countdown')?.textContent.includes('10 秒'));
+    assert.equal(button(document, '仅此页放行 10 分钟').disabled, true);
+    const before = calls.length;
+    instant += 5_000;
+    timers.find((timer) => timer.delay === 1000).callback();
+    await until(() => document.querySelector('.pass-countdown')?.textContent.includes('5 秒'));
+    assert.equal(calls.length, before, 'a local countdown tick does not poll');
+    instant += 5_000;
+    timers.find((timer) => timer.delay === 1000).callback();
+    await until(() => calls.length > before);
+    assert.equal(calls.at(-1).type, 'focus:blocked');
+    assert.equal(
+      button(document, '仅此页放行 10 分钟').disabled,
+      true,
+      'zero alone is not authorization'
+    );
+    budget.canGrant = true;
+    budget.nextAvailableAt = null;
+    budget.reason = '';
+    timers.find((timer) => timer.delay === 2000).callback();
+    await until(() => !button(document, '仅此页放行 10 分钟').disabled);
+    assert.equal(
+      calls.some((call) => call.type === 'focus:check' || call.type === 'focus:pass'),
+      false
+    );
+  } finally {
+    dom.window.disposeUI();
+    dom.window.close();
+  }
+});
+
+test('an existing backend-approved pass can be reused without promising new minutes', async () => {
+  const calls = [],
+    budget = {
+      enabled: true,
+      dailyLimitMinutes: 20,
+      usedMinutes: 20,
+      remainingMinutes: 0,
+      cooldownMinutes: 10,
+      cooldownUntil: Date.now() + 600000,
+      waitSeconds: 600,
+      nextAvailableAt: Date.now() + 600000,
+      canGrant: false,
+      grantMinutes: 0,
+      reason: '每日累计额度已用完',
+    };
+  const state = {
+    config: structuredClone(DEFAULTS),
+    session: null,
+    current: null,
+    judgment: null,
+    checking: false,
+    feedback: [],
+    passBudget: budget,
+    blockedResponse: {
+      url: 'https://www.bilibili.com/',
+      reason: '推荐入口',
+      minutes: 10,
+      canPass: true,
+      passBudget: budget,
+    },
+  };
+  const dom = await mount({
+    page: 'blocked',
+    setup(window) {
+      extensionMock(window, state, calls);
+    },
+  });
+  try {
+    const { document } = dom.window;
+    await until(() => !!button(document, '返回已放行页面'));
+    assert.equal(button(document, '返回已放行页面').disabled, false);
+    assert.match(document.querySelector('.pass-budget').textContent, /不会重新扣减额度或延长/);
+    assert.equal(button(document, '仅此页放行 10 分钟'), undefined);
+  } finally {
+    dom.window.disposeUI();
+    dom.window.close();
+  }
+});
+
+test('pass limit settings support zero and disabling greys all timing controls without discarding values', async () => {
+  const dom = await mount({ hash: '#settings/blocking' });
+  try {
+    const { window } = dom;
+    await until(() => window.document.querySelector('dialog')?.open);
+    const daily = field(window.document, '每日累计放行上限（分钟）'),
+      cooldown = field(window.document, '再次放行冷却（分钟）');
+    assert.equal(daily.min, '0');
+    assert.equal(daily.max, '180');
+    assert.equal(cooldown.min, '0');
+    assert.equal(cooldown.max, '120');
+    input(window, daily, '0');
+    input(window, cooldown, '0');
+    await until(() => !!button(window.document, '保存设置'));
+    button(window.document, '保存设置').click();
+    await until(() => button(window.document, '已保存')?.disabled);
+    const toggle = [...window.document.querySelectorAll('.toggle-field')].find(
+      (el) => el.querySelector('.field-title')?.textContent === '允许临时放行'
+    );
+    assert.match(toggle.textContent, /已有放行也会立即撤销/);
+    const checkbox = toggle.querySelector('input');
+    checkbox.checked = false;
+    checkbox.dispatchEvent(new window.Event('change', { bubbles: true }));
+    await until(() => daily.disabled);
+    assert.equal(cooldown.disabled, true);
+    assert.equal(field(window.document, '被拦截页面临时放行（分钟）').disabled, true);
+    button(window.document, '保存设置').click();
+    await until(() => button(window.document, '已保存')?.disabled);
+    const saved = JSON.parse(window.localStorage.getItem('focus-preview-config'));
+    assert.equal(saved.temporaryPassEnabled, false);
+    assert.equal(saved.passDailyMinutes, 0);
+    assert.equal(saved.passCooldownMinutes, 0);
+    [...window.document.querySelectorAll('.settings-sidebar nav button')]
+      .find((el) => el.textContent.endsWith('内容判断'))
+      .click();
+    await until(() => window.document.querySelector('#settings-title')?.textContent === '内容判断');
+    assert.doesNotMatch(field(window.document, '明确娱乐或偏离目标时').textContent, /保留短时放行/);
+  } finally {
+    dom.window.disposeUI();
+    dom.window.close();
+  }
+});
+
+test('canPass cannot enable a pass with a missing or malformed per-page budget, even when snapshot budget is valid', async () => {
+  const valid = {
+    enabled: true,
+    dailyLimitMinutes: 20,
+    usedMinutes: 0,
+    remainingMinutes: 20,
+    cooldownMinutes: 10,
+    cooldownUntil: 0,
+    canGrant: true,
+    grantMinutes: 10,
+  };
+  for (const bad of [
+    undefined,
+    null,
+    { enabled: true },
+    { ...valid, grantMinutes: -1 },
+    { ...valid, remainingMinutes: '20' },
+    { ...valid, usedMinutes: 20 },
+    { ...valid, canGrant: 'true' },
+    { ...valid, nextAvailableAt: 1e100 },
+  ]) {
+    const calls = [],
+      state = {
+        config: structuredClone(DEFAULTS),
+        session: null,
+        current: null,
+        judgment: null,
+        checking: false,
+        feedback: [],
+        passBudget: valid,
+        blockedResponse: {
+          url: 'https://www.bilibili.com/',
+          reason: '推荐入口',
+          minutes: 10,
+          canPass: true,
+          passBudget: bad,
+        },
+      };
+    const dom = await mount({
+      page: 'blocked',
+      setup(window) {
+        extensionMock(window, state, calls);
+      },
+    });
+    try {
+      const { document } = dom.window;
+      await until(() => document.querySelector('.blocked-url'));
+      const pass = [...document.querySelectorAll('.blocked-actions button')][0];
+      assert.ok(pass);
+      assert.equal(pass.disabled, true, JSON.stringify(bad));
+      pass.click();
+      assert.equal(
+        calls.some((call) => call.type === 'focus:pass'),
+        false
+      );
+      assert.match(document.querySelector('.blocked-page').textContent, /尚未获得有效放行额度/);
+    } finally {
+      dom.window.disposeUI();
+      dom.window.close();
+    }
+  }
+});
+
+test('a complete budget without optional display fields remains compatible', async () => {
+  const budget = {
+    enabled: true,
+    dailyLimitMinutes: 0,
+    usedMinutes: 35,
+    remainingMinutes: null,
+    cooldownMinutes: 0,
+    cooldownUntil: 0,
+    canGrant: true,
+    grantMinutes: 10,
+  };
+  const calls = [],
+    state = {
+      config: structuredClone(DEFAULTS),
+      session: null,
+      current: null,
+      judgment: null,
+      checking: false,
+      feedback: [],
+      passBudget: budget,
+      blockedResponse: {
+        url: 'https://www.bilibili.com/',
+        reason: '推荐入口',
+        canPass: true,
+        passBudget: budget,
+      },
+    };
+  const dom = await mount({
+    page: 'blocked',
+    setup(window) {
+      extensionMock(window, state, calls);
+    },
+  });
+  try {
+    await until(
+      () =>
+        button(dom.window.document, '仅此页放行 10 分钟') &&
+        !button(dom.window.document, '仅此页放行 10 分钟').disabled
+    );
+    assert.match(dom.window.document.querySelector('.pass-budget').textContent, /不设每日累计上限/);
+  } finally {
+    dom.window.disposeUI();
+    dom.window.close();
+  }
+});
+
+test('zero-cooldown existing passes remain reusable even while the budget could grant new minutes', async () => {
+  const calls = [],
+    budget = {
+      enabled: true,
+      dailyLimitMinutes: 20,
+      usedMinutes: 5,
+      remainingMinutes: 15,
+      cooldownMinutes: 0,
+      cooldownUntil: 0,
+      canGrant: true,
+      grantMinutes: 10,
+      nextAvailableAt: Date.now(),
+    };
+  const state = {
+    config: { ...structuredClone(DEFAULTS), passCooldownMinutes: 0 },
+    session: null,
+    current: null,
+    judgment: null,
+    checking: false,
+    feedback: [],
+    passBudget: budget,
+    blockedResponse: {
+      url: 'https://www.bilibili.com/',
+      reason: '推荐入口',
+      minutes: 0,
+      canPass: true,
+      until: Date.now() + 300000,
+      passBudget: budget,
+    },
+  };
+  const dom = await mount({
+    page: 'blocked',
+    setup(window) {
+      extensionMock(window, state, calls);
+    },
+  });
+  try {
+    const { document } = dom.window;
+    await until(() => !!button(document, '返回已放行页面'));
+    assert.equal(button(document, '返回已放行页面').disabled, false);
+    assert.match(document.querySelector('.pass-budget').textContent, /不会重新扣减额度或延长/);
+    assert.equal(button(document, '仅此页放行 10 分钟'), undefined);
+    button(document, '返回已放行页面').click();
+    await until(() => calls.some((call) => call.type === 'focus:pass'));
+    assert.equal(calls.filter((call) => call.type === 'focus:pass').length, 1);
+  } finally {
+    dom.window.disposeUI();
+    dom.window.close();
+  }
+});
+
+test('zero approved minutes need both a future existing lease and final backend permission', async () => {
+  for (const item of [
+    { canPass: true, until: undefined, canGrant: true },
+    { canPass: true, until: Date.now() - 1000, canGrant: true },
+    { canPass: true, until: undefined, canGrant: false },
+    { canPass: true, until: Date.now() - 1000, canGrant: false },
+    { canPass: false, until: Date.now() + 300000, canGrant: true },
+    { canPass: true, until: 1e100, canGrant: true },
+  ]) {
+    const calls = [],
+      budget = {
+        enabled: true,
+        dailyLimitMinutes: 20,
+        usedMinutes: 5,
+        remainingMinutes: 15,
+        cooldownMinutes: 0,
+        cooldownUntil: 0,
+        canGrant: item.canGrant,
+        grantMinutes: 10,
+      };
+    const state = {
+      config: structuredClone(DEFAULTS),
+      session: null,
+      current: null,
+      judgment: null,
+      checking: false,
+      feedback: [],
+      passBudget: budget,
+      blockedResponse: {
+        url: 'https://www.bilibili.com/',
+        reason: '推荐入口',
+        minutes: 0,
+        canPass: item.canPass,
+        until: item.until,
+        passBudget: budget,
+      },
+    };
+    const dom = await mount({
+      page: 'blocked',
+      setup(window) {
+        extensionMock(window, state, calls);
+      },
+    });
+    try {
+      const { document } = dom.window;
+      await until(() => document.querySelector('.blocked-url'));
+      const pass = [...document.querySelectorAll('.blocked-actions button')][0];
+      assert.equal(pass.disabled, true, JSON.stringify(item));
+      assert.equal(button(document, '返回已放行页面'), undefined);
+      pass.click();
+      assert.equal(
+        calls.some((call) => call.type === 'focus:pass'),
+        false
+      );
+    } finally {
+      dom.window.disposeUI();
+      dom.window.close();
+    }
+  }
+});
+
+test('an already available pass does not repeatedly refresh as its immediate nextAvailableAt expires', async () => {
+  let instant = 1_800_000_000_000;
+  const timers = [],
+    calls = [],
+    budget = {
+      enabled: true,
+      dailyLimitMinutes: 20,
+      usedMinutes: 0,
+      remainingMinutes: 20,
+      cooldownMinutes: 10,
+      cooldownUntil: 0,
+      canGrant: true,
+      grantMinutes: 10,
+      nextAvailableAt: instant,
+    };
+  const state = {
+    config: structuredClone(DEFAULTS),
+    session: null,
+    current: null,
+    judgment: null,
+    checking: false,
+    feedback: [],
+    passBudget: budget,
+  };
+  const dom = await mount({
+    page: 'blocked',
+    setup(window) {
+      extensionMock(window, state, calls);
+      window.Date.now = () => instant;
+      window.setInterval = (callback, delay) => {
+        timers.push({ callback, delay });
+        return timers.length;
+      };
+      window.clearInterval = () => {};
+    },
+  });
+  try {
+    await until(
+      () =>
+        button(dom.window.document, '仅此页放行 10 分钟') &&
+        !button(dom.window.document, '仅此页放行 10 分钟').disabled
+    );
+    const before = calls.length;
+    for (let step = 0; step < 3; step++) {
+      instant += 1000;
+      budget.nextAvailableAt = instant;
+      timers.find((timer) => timer.delay === 1000).callback();
+      await new Promise((resolve) => setTimeout(resolve, 35));
+    }
+    assert.equal(calls.length, before, 'local ticks do not refresh an already available pass');
+    timers.find((timer) => timer.delay === 2000).callback();
+    await until(() => calls.length > before);
+    assert.equal(calls.length, before + 1, 'the normal read-only poll remains unchanged');
+    assert.equal(calls.at(-1).type, 'focus:blocked');
+    assert.equal(
+      calls.some((call) => call.type === 'focus:check' || call.type === 'focus:pass'),
+      false
+    );
   } finally {
     dom.window.disposeUI();
     dom.window.close();

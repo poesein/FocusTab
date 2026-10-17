@@ -2,6 +2,7 @@ import { loadConfig, validatePatch } from "./config.mjs";
 import {
   blockedBy,
   canAnalyze,
+  explainAnalysisEligibility,
   cleanURL,
   documentKey,
   feedbackLookup,
@@ -10,14 +11,36 @@ import {
 } from "./rules.mjs";
 import { classify, probe } from "./ai.mjs";
 import { resolveSearch } from "./search.mjs";
+import {
+  pageIdentity,
+  samePageURL,
+  semanticPageTitle,
+  semanticPageURL,
+} from "./page-identity.mjs";
 import { applyInitialActionPreset } from "./deployment.mjs";
+import {
+  describePassBudget,
+  normalizePassBudget,
+  reservePass,
+} from "./pass-budget.mjs";
 
 export class FocusEngine {
-  constructor(api, enqueue, now = () => Date.now(), ai = classify) {
+  constructor(
+    api,
+    enqueue,
+    now = () => Date.now(),
+    ai = classify,
+    timers = globalThis
+  ) {
     this.api = api;
     this.enqueue = enqueue;
     this.now = now;
     this.ai = ai;
+    this.timers = timers;
+    this.aiTimer = null;
+    this.aiTimerAt = null;
+    this.aiAlarmAt = null;
+    this.scheduleLoaded = false;
     this.runtime = {
       autoSessionId: "auto:" + crypto.randomUUID(),
       contextToken: null,
@@ -34,6 +57,7 @@ export class FocusEngine {
     this.session = null;
     this.feedback = [];
     this.config = loadConfig();
+    this.passBudgetRecord = normalizePassBudget(null, this.now());
     this.pending = null;
     this.popupFocus = null;
     this.focusTransition = null;
@@ -47,11 +71,16 @@ export class FocusEngine {
         "focusConfig",
         "focusSession",
         "focusFeedback",
+        "focusPassBudget",
       ]),
       this.api.storage.session.get("focusRuntime"),
     ]);
     const local = await applyInitialActionPreset(this.api, stored);
     this.config = loadConfig(local.focusConfig);
+    this.passBudgetRecord = normalizePassBudget(
+      local.focusPassBudget,
+      this.now()
+    );
     this.session = local.focusSession || null;
     this.feedback = (local.focusFeedback || [])
       .filter((r) => r.created > this.now() - this.config.retentionDays * 864e5)
@@ -79,28 +108,129 @@ export class FocusEngine {
       this.session = null;
     this.api.idle.setDetectionInterval(this.config.idleSeconds);
     await this.syncRules();
-    // Session DNR rules survive worker suspension. Reconcile them against their
-    // leases after every wake so an interrupted write cannot leave an allow.
-    const { focusPasses = [] } = await this.api.storage.session.get(
-      "focusPasses"
-    );
-    const liveIds = new Set(
-      focusPasses.filter((p) => p.until > this.now()).map((p) => p.ruleId)
-    );
-    const oldSessionRules =
-      await this.api.declarativeNetRequest.getSessionRules();
-    await this.api.declarativeNetRequest.updateSessionRules({
-      removeRuleIds: oldSessionRules
-        .filter((r) => !liveIds.has(r.id))
-        .map((r) => r.id),
-    });
-    await this.api.alarms.create("focus-check", { periodInMinutes: 0.5 });
+    // Maintenance reconciles native rules with their leases on every wake,
+    // including orphan allows from a worker interrupted during a grant.
+    const heartbeat = await this.api.alarms.get?.("focus-check");
+    if (!heartbeat)
+      await this.api.alarms.create("focus-check", { periodInMinutes: 0.5 });
     // Startup can be caused by a read-only popup state request. Restore local
     // state without using the NAS; normal browser/alarm events run analysis.
     await this.reconcile({ analyze: false });
   }
   async saveRuntime() {
+    await this.syncAnalysisSchedule();
     await this.api.storage.session.set({ focusRuntime: this.runtime });
+  }
+  analysisPlan() {
+    const now = this.now(),
+      active = this.runtime.active;
+    const context = this.effectiveContext();
+    if (
+      !active ||
+      !context ||
+      !this.config.aiEnabled ||
+      this.pending ||
+      !canAnalyze(active.url, this.config)
+    )
+      return null;
+    const key = this.contextKey(context, active.url, active.title);
+    const dwellAt = active.since + this.config.dwellSeconds * 1000;
+    const correction = feedbackLookup(
+      this.feedback,
+      key,
+      context.id,
+      this.config,
+      now
+    );
+    if (correction) {
+      const applied =
+        this.runtime.judgment?.key === key &&
+        this.runtime.judgment.source === "human" &&
+        this.runtime.judgment.label === correction.label;
+      return {
+        at: applied
+          ? correction.created + this.config.retentionDays * 864e5
+          : Math.max(now, dwellAt),
+        reason: applied ? "feedback" : "dwelling",
+      };
+    }
+    const cached = this.runtime.cache.find(
+      (r) => r.key === key && now - r.created < this.config.cacheMinutes * 6e4
+    );
+    if (
+      cached &&
+      !(
+        this.runtime.judgment?.key === key &&
+        this.runtime.judgment.created === cached.created
+      )
+    ) {
+      return { at: Math.max(now, dwellAt), reason: "dwelling" };
+    }
+    let at = Math.max(now, dwellAt),
+      reason = "dwelling";
+    if (cached) {
+      at = Math.max(at, cached.created + this.config.cacheMinutes * 6e4);
+      reason = "cache";
+    }
+    const intervalAt = this.runtime.lastAI + this.config.intervalSeconds * 1000;
+    if (intervalAt > at) {
+      at = intervalAt;
+      reason = "interval";
+    }
+    const calls = this.runtime.calls
+      .filter((t) => now - t < 36e5)
+      .sort((a, b) => a - b);
+    if (calls.length >= this.config.requestsPerHour) {
+      const quotaAt = calls[calls.length - this.config.requestsPerHour] + 36e5;
+      if (quotaAt > at) {
+        at = quotaAt;
+        reason = "hour-limit";
+      }
+    }
+    return { at, reason };
+  }
+  async syncAnalysisSchedule() {
+    if (!this.scheduleLoaded) {
+      const existing = await this.api.alarms.get?.("focus-ai-deadline");
+      this.aiAlarmAt = existing?.scheduledTime ?? null;
+      this.scheduleLoaded = true;
+    }
+    const plan = this.analysisPlan();
+    this.runtime.nextCheckAt = plan?.at ?? null;
+    if (!plan) {
+      if (this.aiTimer !== null) this.timers.clearTimeout(this.aiTimer);
+      this.aiTimer = null;
+      this.aiTimerAt = null;
+      if (this.aiAlarmAt !== null)
+        await this.api.alarms.clear("focus-ai-deadline");
+      this.aiAlarmAt = null;
+      return;
+    }
+    // Short timers meet dwell deadlines while the worker is naturally awake.
+    // Long deadlines use alarms; no polling or calls to keep the worker alive.
+    const delay = Math.max(1, plan.at - this.now());
+    const timerAt = delay <= 25000 ? plan.at : null;
+    if (this.aiTimerAt !== timerAt) {
+      if (this.aiTimer !== null) this.timers.clearTimeout(this.aiTimer);
+      this.aiTimer = null;
+      this.aiTimerAt = timerAt;
+      if (timerAt !== null) {
+        this.aiTimer = this.timers.setTimeout(() => {
+          this.aiTimer = null;
+          this.aiTimerAt = null;
+          this.enqueue(() => this.reconcile());
+        }, delay);
+        this.aiTimer?.unref?.();
+      }
+    }
+    // A new worker restores this deadline from normal state calculation. Never
+    // replace an identical native alarm on every heartbeat (that can delay it).
+    if (this.aiAlarmAt !== plan.at) {
+      const existing = await this.api.alarms.get?.("focus-ai-deadline");
+      if (!existing || existing.scheduledTime !== plan.at)
+        await this.api.alarms.create("focus-ai-deadline", { when: plan.at });
+      this.aiAlarmAt = plan.at;
+    }
   }
   async syncRules() {
     const rules = makeDNR(this.config, this.api.runtime.getURL(""));
@@ -183,8 +313,7 @@ export class FocusEngine {
       !!tab &&
       transition?.until > this.now() &&
       transition.windowId === tab.windowId &&
-      transition.identity ===
-        JSON.stringify([tab.id, tab.url, tab.title || ""]) &&
+      transition.identity === pageIdentity(tab) &&
       this.runtime.diagnostics?.idleState === "active" &&
       canAnalyze(tab.url, this.config)
     );
@@ -211,8 +340,8 @@ export class FocusEngine {
     // but automatic work/learning judgments never share the task key space.
     return documentKey(
       JSON.stringify([context.mode, context.goal]),
-      url,
-      title
+      semanticPageURL(url),
+      semanticPageTitle(title, url)
     );
   }
   matchesContext(row, context = this.effectiveContext()) {
@@ -225,14 +354,16 @@ export class FocusEngine {
     const context = this.effectiveContext(),
       active = this.runtime.active,
       now = this.now();
-    const base = { mode: context?.mode || "off" };
-    const status = (code, message, waitSeconds) => ({
+    const plan = this.analysisPlan();
+    const base = {
+      mode: context?.mode || "off",
+      nextCheckAt: plan?.at ?? null,
+      waitSeconds: plan ? Math.max(0, Math.ceil((plan.at - now) / 1000)) : 0,
+    };
+    const status = (code, message) => ({
       ...base,
       code,
       message,
-      ...(waitSeconds
-        ? { waitSeconds: Math.max(1, Math.ceil(waitSeconds)) }
-        : {}),
     });
     if (!this.config.aiEnabled)
       return status("disabled", "AI 内容判断已关闭，网址规则仍生效。");
@@ -243,11 +374,12 @@ export class FocusEngine {
       );
     if (!active)
       return status("no-page", "仅判断前台、非无痕且处于活跃状态的网页。");
-    if (!canAnalyze(active.url, this.config))
-      return status(
-        "excluded",
-        "此页面属于搜索结果、隐私页面或未选择的网站，不发送给 AI。"
-      );
+    const eligibility = explainAnalysisEligibility(active.url, this.config);
+    if (!eligibility.eligible)
+      return {
+        ...status("excluded", eligibility.message),
+        exclusionCode: eligibility.code,
+      };
     if (this.pending)
       return status(
         "checking",
@@ -261,29 +393,25 @@ export class FocusEngine {
         "AI 连接失败，当前网页保持开放；请检查下方错误与连接设置。"
       );
     const key = this.contextKey(context, active.url, active.title);
-    if (this.runtime.judgment?.key === key)
+    if (
+      this.runtime.judgment?.key === key &&
+      ["cache", "feedback"].includes(plan?.reason)
+    )
       return status("judged", "已判断当前网页；可纠正结果。");
-    const dwell = this.config.dwellSeconds - (now - active.since) / 1000;
-    if (dwell > 0)
+    if (plan?.at > now && plan.reason === "dwelling")
       return status(
         "dwelling",
-        "停留片刻后自动判断；手动检查仍遵守 NAS 请求限额。",
-        dwell
+        "停留片刻后自动判断；手动检查仍遵守 NAS 请求限额。"
       );
-    const calls = this.runtime.calls.filter((t) => now - t < 36e5);
-    if (calls.length >= this.config.requestsPerHour)
+    if (plan?.at > now && plan.reason === "hour-limit")
       return status(
         "hour-limit",
-        "本小时 AI 请求额度已用完，当前网页保持开放。",
-        (Math.min(...calls) + 36e5 - now) / 1000
+        "本小时 AI 请求额度已用完，当前网页保持开放。"
       );
-    const interval =
-      this.config.intervalSeconds - (now - this.runtime.lastAI) / 1000;
-    if (interval > 0)
+    if (plan?.at > now && plan.reason === "interval")
       return status(
         "interval",
-        "正在等待 NAS 请求间隔，当前网页暂时保持开放。",
-        interval
+        "正在等待 NAS 请求间隔，当前网页暂时保持开放。"
       );
     return status(
       "ready",
@@ -472,8 +600,7 @@ export class FocusEngine {
           diagnostics.idleState === "active" &&
           this.focusTransition?.until > this.now() &&
           this.focusTransition.windowId === win.id &&
-          this.focusTransition.identity ===
-            JSON.stringify([tab.id, tab.url, tab.title || ""]) &&
+          this.focusTransition.identity === pageIdentity(tab) &&
           canAnalyze(tab.url, this.config)
         ) {
           diagnostics.focusSource = "transition";
@@ -499,7 +626,7 @@ export class FocusEngine {
         );
       this.lastEngaged = {
         windowId: win.id,
-        identity: JSON.stringify([tab.id, tab.url, tab.title || ""]),
+        identity: pageIdentity(tab),
       };
       return finish(
         "ready",
@@ -528,8 +655,11 @@ export class FocusEngine {
       this.runtime.judgment = null;
       return;
     }
-    const identity = JSON.stringify([tab.id, tab.url, tab.title || ""]);
-    if (this.runtime.active?.identity !== identity) {
+    const identity = pageIdentity(tab);
+    if (
+      this.runtime.active?.identity !== identity &&
+      (!this.runtime.active || pageIdentity(this.runtime.active) !== identity)
+    ) {
       this.cancelPending();
       this.runtime.judgment = null;
       this.runtime.active = {
@@ -539,6 +669,12 @@ export class FocusEngine {
         title: (tab.title || "").slice(0, 300),
         since: this.now(),
       };
+    } else {
+      // Tracking/branding changes do not reset dwell or cancel the semantic
+      // document, but exact URL passes and any navigation retain the live URL.
+      this.runtime.active.url = tab.url;
+      this.runtime.active.title = (tab.title || "").slice(0, 300);
+      this.runtime.active.identity = identity;
     }
   }
   async refreshCurrentPage() {
@@ -587,23 +723,16 @@ export class FocusEngine {
       await this.saveRuntime();
       return;
     }
-    const identity = JSON.stringify([tab.id, tab.url, tab.title || ""]);
-    if (old?.identity !== identity) {
-      this.cancelPending();
-      this.runtime.judgment = null;
-      this.runtime.active = {
-        identity,
-        tabId: tab.id,
-        url: tab.url,
-        title: (tab.title || "").slice(0, 300),
-        since: now,
-      };
+    const changed = old?.identity !== pageIdentity(tab);
+    this.updateActive(tab);
+    if (changed) {
       await this.api.action.setBadgeText({ text: "" });
     }
     if (analyze) this.maybeAI();
     await this.saveRuntime();
   }
   async currentPass(tabId, raw) {
+    if (!this.config.temporaryPassEnabled) return false;
     const { focusPasses = [] } = await this.api.storage.session.get(
       "focusPasses"
     );
@@ -615,32 +744,58 @@ export class FocusEngine {
     const { focusPasses = [] } = await this.api.storage.session.get(
       "focusPasses"
     );
-    const keep = [];
-    for (const pass of focusPasses) {
-      if (pass.until > this.now()) {
-        keep.push(pass);
-        continue;
-      }
+    const keep = focusPasses.filter(
+      (p) => this.config.temporaryPassEnabled && p.until > this.now()
+    );
+    const liveIds = new Set(keep.map((p) => p.ruleId));
+    const rules = await this.api.declarativeNetRequest.getSessionRules();
+    const revokedRules = rules.filter((rule) => !liveIds.has(rule.id));
+    if (revokedRules.length)
       await this.api.declarativeNetRequest.updateSessionRules({
-        removeRuleIds: [pass.ruleId],
+        removeRuleIds: revokedRules.map((rule) => rule.id),
       });
+    const revoked = focusPasses.filter((p) => !keep.includes(p));
+    // Native rules have no expiry of their own. Orphans must be removed even
+    // without a recorded lease, and their already-open background pages checked.
+    for (const rule of revokedRules) {
+      for (const tabId of rule.condition?.tabIds || []) {
+        if (!revoked.some((p) => p.tabId === tabId))
+          revoked.push({ tabId, ruleId: rule.id, url: null, until: 0 });
+      }
+    }
+    let navigationError;
+    for (const pass of revoked) {
+      let tab;
       try {
-        const tab = await this.api.tabs.get(pass.tabId);
-        if (tab.url === pass.url) {
-          const aiBlock = await this.aiBlock(tab.id, tab.url);
-          if (blockedBy(tab.url, this.config) || aiBlock)
+        tab = await this.api.tabs.get(pass.tabId);
+      } catch {
+        continue; // A closed tab needs no redirect or lease.
+      }
+      if (
+        !this.config.temporaryPassEnabled ||
+        !pass.url ||
+        tab.url === pass.url
+      ) {
+        const aiBlock = await this.aiBlock(tab.id, tab.url);
+        if (blockedBy(tab.url, this.config) || aiBlock) {
+          try {
             await this.api.tabs.update(tab.id, {
               url:
                 this.api.runtime.getURL("blocked.html") +
                 (aiBlock ? "#ai" : "#url=" + encodeURIComponent(tab.url)),
             });
+          } catch (error) {
+            // The allow is already removed; retain only an expired retry lease
+            // so a transient navigation failure also gets retried in background.
+            keep.push({ ...pass, url: tab.url, until: 0 });
+            navigationError = error;
+          }
         }
-      } catch {
-        /* closed tab */
       }
     }
-    if (keep.length !== focusPasses.length)
+    if (JSON.stringify(keep) !== JSON.stringify(focusPasses))
       await this.api.storage.session.set({ focusPasses: keep });
+    if (navigationError) throw navigationError;
   }
   async contextIsCurrent(context, active, allowTransition = false) {
     const current = this.effectiveContext();
@@ -652,10 +807,7 @@ export class FocusEngine {
     } catch {
       return false;
     }
-    return (
-      !!tab &&
-      JSON.stringify([tab.id, tab.url, tab.title || ""]) === active.identity
-    );
+    return !!tab && pageIdentity(tab) === active.identity;
   }
   async applyJudgment(result, active, context, key, notify = true) {
     await this.api.action.setBadgeBackgroundColor({
@@ -680,15 +832,20 @@ export class FocusEngine {
           : "这一页可能偏离了研究目标或属于娱乐",
         result.reason
       );
+    // A notification/badge API await can race navigation. Resolve the current
+    // exact URL again before any enforcement, retaining precise pass scope.
+    if (!(await this.contextIsCurrent(context, active, !!this.pending))) return;
+    const target = this.currentCandidate;
+    if (!target || !canAnalyze(target.url, this.config)) return;
     if (
       this.config.aiEnabled &&
       this.config.aiAction === "block" &&
-      !(await this.currentPass(active.tabId, active.url))
+      !(await this.currentPass(target.id, target.url))
     ) {
       await this.api.storage.session.set({
-        ["aiBlock:" + active.tabId]: {
-          url: active.url,
-          title: active.title,
+        ["aiBlock:" + target.id]: {
+          url: target.url,
+          title: target.title || "",
           reason: result.reason,
           key,
           sessionId: context.id,
@@ -697,7 +854,7 @@ export class FocusEngine {
           source: result.source || "ai",
         },
       });
-      await this.api.tabs.update(active.tabId, {
+      await this.api.tabs.update(target.id, {
         url: this.api.runtime.getURL("blocked.html") + "#ai",
       });
     }
@@ -760,6 +917,16 @@ export class FocusEngine {
       (r) => r.key === key && now - r.created < this.config.cacheMinutes * 6e4
     );
     if (cached && !force) {
+      if (
+        this.runtime.judgment?.key === key &&
+        this.runtime.judgment.created === cached.created &&
+        !(
+          cached.label === "unrelated" &&
+          cached.confidence >= this.config.threshold &&
+          this.config.aiAction === "block"
+        )
+      )
+        return;
       this.reuseJudgment(cached, active, context);
       return;
     }
@@ -817,6 +984,7 @@ export class FocusEngine {
       .finally(() => {
         clearTimeout(timeout);
         if (this.pending === pending) this.pending = null;
+        this.enqueue(() => this.saveRuntime());
       });
   }
   async isCurrent(pending) {
@@ -848,7 +1016,8 @@ export class FocusEngine {
           func: (max) => globalThis.__focusTabExtract(max),
           args: [config.excerptChars],
         });
-        if (row?.result?.url !== active.url) throw new Error("页面已切换");
+        if (!row?.result || !samePageURL(row.result.url, active.url))
+          throw new Error("页面已切换");
         page = row.result;
       } catch (error) {
         if (error.message === "页面已切换") throw error;
@@ -884,10 +1053,165 @@ export class FocusEngine {
       /* A denied OS notification must not interrupt enforcement. */
     }
   }
+  passBudget() {
+    return describePassBudget(this.config, this.passBudgetRecord, this.now());
+  }
+  async grantPass(tabId, original, focusPasses) {
+    if (!this.config.temporaryPassEnabled) throw new Error("临时放行已关闭。");
+    const existing = focusPasses.find(
+      (p) => p.tabId === tabId && p.url === original && p.until > this.now()
+    );
+    const ruleId = 100000 + tabId;
+    // Fragments never reach the network; keep them in the lease and return URL.
+    const networkURL = new URL(original);
+    networkURL.hash = "";
+    const exact =
+      "^" + networkURL.href.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$";
+    const supported = await this.api.declarativeNetRequest.isRegexSupported({
+      regex: exact,
+      isCaseSensitive: true,
+    });
+    if (!supported.isSupported)
+      throw new Error("网址太长，无法精确放行；请从检索页查找资料");
+    const rule = {
+      id: ruleId,
+      priority: 10,
+      action: { type: "allow" },
+      condition: {
+        tabIds: [tabId],
+        regexFilter: exact,
+        isUrlFilterCaseSensitive: true,
+        resourceTypes: ["main_frame"],
+      },
+    };
+    if (existing) {
+      // Restoring a lost native rule is safe: reuse the same bounded lease,
+      // without charging again or extending its original deadline.
+      await this.api.declarativeNetRequest.updateSessionRules({
+        removeRuleIds: [ruleId],
+        addRules: [rule],
+      });
+      return { reused: true, until: existing.until };
+    }
+    const reservation = reservePass(
+      this.config,
+      this.passBudgetRecord,
+      this.now()
+    );
+    const native = await this.api.declarativeNetRequest.getSessionRules();
+    const previousRules = native.filter(
+      (r) =>
+        r.id === ruleId &&
+        focusPasses.some((p) => p.ruleId === ruleId && p.until > this.now())
+    );
+    const lease = { tabId, ruleId, url: original, until: reservation.until };
+    const nextPasses = [...focusPasses.filter((p) => p.tabId !== tabId), lease];
+    // Reserve aggregate quota before installing an allow. The background queue
+    // serializes all tabs, so a second grant observes this debit.
+    try {
+      await this.api.storage.local.set({ focusPassBudget: reservation.next });
+    } catch (error) {
+      // No allow has been installed. Recover a write whose response was lost,
+      // so an API rejection alone cannot silently consume the daily allowance.
+      try {
+        const stored = (await this.api.storage.local.get("focusPassBudget"))
+          .focusPassBudget;
+        this.passBudgetRecord = normalizePassBudget(stored, this.now());
+        if (JSON.stringify(stored) === JSON.stringify(reservation.next)) {
+          await this.api.storage.local.set({
+            focusPassBudget: reservation.previous,
+          });
+          this.passBudgetRecord = reservation.previous;
+        }
+      } catch {
+        /* A storage failure is reported; no native allow exists. */
+      }
+      throw error;
+    }
+    this.passBudgetRecord = reservation.next;
+    try {
+      await this.api.declarativeNetRequest.updateSessionRules({
+        removeRuleIds: [ruleId],
+        addRules: [rule],
+      });
+      await this.api.storage.session.set({ focusPasses: nextPasses });
+    } catch (error) {
+      let nativeRestored = false,
+        sessionRestored = false;
+      // A rejected API may have committed before the worker saw its response.
+      // Verify rollback, rather than refunding while an allow might still live.
+      for (let attempt = 0; attempt < 2 && !nativeRestored; attempt++) {
+        try {
+          await this.api.declarativeNetRequest.updateSessionRules({
+            removeRuleIds: [ruleId],
+            addRules: previousRules,
+          });
+        } catch {
+          /* Verify the actual rules even after a rejected call. */
+        }
+        try {
+          nativeRestored =
+            JSON.stringify(
+              (await this.api.declarativeNetRequest.getSessionRules()).filter(
+                (r) => r.id === ruleId
+              )
+            ) === JSON.stringify(previousRules);
+        } catch {
+          /* An unverified rollback must not refund quota. */
+        }
+      }
+      if (nativeRestored) {
+        for (let attempt = 0; attempt < 2 && !sessionRestored; attempt++) {
+          try {
+            const current =
+              (await this.api.storage.session.get("focusPasses")).focusPasses ||
+              [];
+            if (JSON.stringify(current) !== JSON.stringify(focusPasses))
+              await this.api.storage.session.set({ focusPasses });
+            const restored =
+              (await this.api.storage.session.get("focusPasses")).focusPasses ||
+              [];
+            sessionRestored =
+              JSON.stringify(restored) === JSON.stringify(focusPasses);
+          } catch {
+            /* Retain the debit until rollback is verified. */
+          }
+        }
+      }
+      if (nativeRestored && sessionRestored) {
+        try {
+          await this.api.storage.local.set({
+            focusPassBudget: reservation.previous,
+          });
+          this.passBudgetRecord = reservation.previous;
+        } catch {
+          throw new Error(
+            error.message + "；放行已撤销，但额度恢复失败，请检查浏览器存储。"
+          );
+        }
+      } else {
+        // Keep any possibly-installed allow bounded by a recorded expiry and
+        // an alarm. Maintenance also removes unregistered native rules.
+        try {
+          if (!nativeRestored)
+            await this.api.storage.session.set({ focusPasses: nextPasses });
+          await this.api.alarms.create("focus-expiry", { when: lease.until });
+        } catch {
+          /* The normal heartbeat and next worker wake retry cleanup. */
+        }
+        throw new Error(
+          error.message + "；未能确认放行清理，已保留额度扣除并安排到期清理。"
+        );
+      }
+      throw error;
+    }
+    return { reused: false, minutes: reservation.minutes, until: lease.until };
+  }
   async snapshot() {
     const active = this.runtime.active;
     return {
       config: this.config,
+      passBudget: this.passBudget(),
       session: this.session,
       status: this.classificationStatus(),
       current:
@@ -1026,11 +1350,7 @@ export class FocusEngine {
           a = { ...row, tabId: sender.tab.id };
       } else if (a) {
         const tab = await this.foreground();
-        if (
-          !tab ||
-          JSON.stringify([tab.id, tab.url, tab.title || ""]) !== a.identity
-        )
-          a = null;
+        if (!tab || pageIdentity(tab) !== a.identity) a = null;
       }
       if (!a || !context || !canAnalyze(a.url, this.config))
         throw new Error("当前没有可纠正的内容页面");
@@ -1131,6 +1451,15 @@ export class FocusEngine {
           : !blockedBy(original, this.config))
       )
         throw new Error("没有可放行的页面");
+      const { focusPasses = [] } = await this.api.storage.session.get(
+        "focusPasses"
+      );
+      const existing =
+        this.config.temporaryPassEnabled &&
+        focusPasses.find(
+          (p) => p.tabId === tabId && p.url === original && p.until > this.now()
+        );
+      const passBudget = this.passBudget();
       if (type === "focus:blocked")
         return {
           url: cleanURL(original),
@@ -1141,61 +1470,15 @@ export class FocusEngine {
           ai: !!payload.ai,
           source: payload.ai ? stored.source || "ai" : "rule",
           mode: payload.ai ? stored.mode || "task" : null,
-          minutes: this.config.allowMinutes,
+          passBudget,
+          canPass: !!existing || passBudget.canGrant,
+          minutes: existing ? 0 : passBudget.grantMinutes,
+          until: existing ? existing.until : null,
         };
-      const { focusPasses = [] } = await this.api.storage.session.get(
-        "focusPasses"
-      );
-      const ruleId = 100000 + tabId;
-      // URL fragments never reach the network; matching them in a DNR regex
-      // would make a seemingly granted pass fail on its first navigation.
-      const networkURL = new URL(original);
-      networkURL.hash = "";
-      const exact =
-        "^" + networkURL.href.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$";
-      const supported = await this.api.declarativeNetRequest.isRegexSupported({
-        regex: exact,
-        isCaseSensitive: true,
-      });
-      if (!supported.isSupported)
-        throw new Error("网址太长，无法精确放行；请从检索页查找资料");
-      await this.api.declarativeNetRequest.updateSessionRules({
-        removeRuleIds: [ruleId],
-        addRules: [
-          {
-            id: ruleId,
-            priority: 10,
-            action: { type: "allow" },
-            condition: {
-              tabIds: [tabId],
-              regexFilter: exact,
-              isUrlFilterCaseSensitive: true,
-              resourceTypes: ["main_frame"],
-            },
-          },
-        ],
-      });
-      try {
-        await this.api.storage.session.set({
-          focusPasses: [
-            ...focusPasses.filter((p) => p.tabId !== tabId),
-            {
-              tabId,
-              ruleId,
-              url: original,
-              until: this.now() + this.config.allowMinutes * 6e4,
-            },
-          ],
-        });
-      } catch (error) {
-        await this.api.declarativeNetRequest.updateSessionRules({
-          removeRuleIds: [ruleId],
-        });
-        throw error;
-      }
+      const result = await this.grantPass(tabId, original, focusPasses);
       await this.maintenance();
       await this.api.tabs.update(tabId, { url: original });
-      return { ok: true };
+      return { ok: true, ...result, passBudget: this.passBudget() };
     }
     throw new Error("不支持的操作");
   }

@@ -40,7 +40,7 @@ chrome.webNavigation.onReferenceFragmentUpdated.addListener((info) => {
   if (info.frameId === 0) reconcile();
 });
 chrome.alarms.onAlarm.addListener((info) => {
-  if (info.name === 'focus-check' || info.name === 'focus-expiry') reconcile();
+  if (['focus-check', 'focus-expiry', 'focus-ai-deadline'].includes(info.name)) reconcile();
 });
 chrome.runtime.onMessage.addListener((message, sender, reply) => {
   if (
