@@ -11,6 +11,9 @@ const out = path.resolve(root, 'dist');
 // A personal LAN destination can be supplied at build time without publishing
 // deployment-specific network metadata in the repository or CI artifacts.
 const aiHost = validateEndpoint(process.env.FOCUSTAB_AI_HOST || 'http://127.0.0.1:11434');
+const initialAction = process.env.FOCUSTAB_INITIAL_AI_ACTION || null;
+if (initialAction && !['block', 'remind'].includes(initialAction))
+  throw new Error('FOCUSTAB_INITIAL_AI_ACTION must be block or remind');
 // Keep cleanup confined to this package's generated output.
 if (path.dirname(out) !== path.resolve(root) || path.basename(out) !== 'dist')
   throw new Error('Unsafe output path');
@@ -38,7 +41,11 @@ const shared = {
   legalComments: 'linked',
   metafile: true,
   logLevel: 'info',
-  define: { 'process.env.NODE_ENV': '"production"', FOCUSTAB_AI_HOST: JSON.stringify(aiHost) },
+  define: {
+    'process.env.NODE_ENV': '"production"',
+    FOCUSTAB_AI_HOST: JSON.stringify(aiHost),
+    FOCUSTAB_INITIAL_AI_ACTION: JSON.stringify(initialAction),
+  },
 };
 const results = [];
 for (const [entry, output, format] of [
@@ -105,3 +112,7 @@ console.log(
 console.log(
   `Stable unpacked extension ID: ${extensionId}\nOllama allowed origin: chrome-extension://${extensionId}`
 );
+if (initialAction)
+  console.log(
+    `Personal build: one-time initial AI action = ${initialAction}; saved configuration will be backed up locally and later choices remain editable.`
+  );

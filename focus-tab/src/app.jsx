@@ -1,7 +1,7 @@
 import { render } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import Sortable from 'sortablejs/modular/sortable.core.esm.js';
-import { request, isExtension, openSettingsPage } from './bridge.mjs';
+import { request, isExtension, openSettingsPage, reportPopupFocus } from './bridge.mjs';
 import { BUILTINS } from './rules.mjs';
 import { PRESETS, validatePatch } from './config.mjs';
 import { blockedPayload } from './blocked-location.mjs';
@@ -163,9 +163,27 @@ function App() {
       if (page === 'popup' && !document.hidden) refresh();
     }, 2000);
     const changed = () => {
+      if (page === 'popup') {
+        reportPopupFocus(
+          document.visibilityState === 'visible' &&
+            typeof document.hasFocus === 'function' &&
+            document.hasFocus()
+        ).catch(() => {});
+      }
       if (!document.hidden) refresh();
     };
     document.addEventListener('visibilitychange', changed);
+    const focused = () => {
+      if (page !== 'popup') return;
+      reportPopupFocus(true).catch(() => {});
+      refresh();
+    };
+    const blurred = () => {
+      if (page === 'popup') reportPopupFocus(false).catch(() => {});
+    };
+    window.addEventListener('focus', focused);
+    window.addEventListener('blur', blurred);
+    window.addEventListener('pagehide', blurred);
     const storageChanged = (changes) => {
       if (changes.focusSession || changes.focusConfig || changes.focusRuntime) refresh();
     };
@@ -185,6 +203,10 @@ function App() {
     return () => {
       clearInterval(timer);
       document.removeEventListener('visibilitychange', changed);
+      window.removeEventListener('focus', focused);
+      window.removeEventListener('blur', blurred);
+      window.removeEventListener('pagehide', blurred);
+      if (page === 'popup') reportPopupFocus(false).catch(() => {});
       document.removeEventListener('keydown', key);
       if (isExtension) chrome.storage.onChanged.removeListener(storageChanged);
     };
@@ -405,6 +427,8 @@ function App() {
                   : '正在对照研究目标…'
                 : judgment
                 ? judgmentLabels[judgment.label]
+                : state.diagnostics?.eligible === false
+                ? '暂未满足判断条件'
                 : !state.current
                 ? '等待识别普通网页'
                 : config.autoClassify
@@ -432,11 +456,12 @@ function App() {
               {checkStatus}
             </p>
           )}
-          {!state.current && state.diagnostics?.message && (
-            <p class="fine page-diagnostic" role="status">
-              {state.diagnostics.message}
-            </p>
-          )}
+          {(!state.current || state.diagnostics?.eligible === false) &&
+            state.diagnostics?.message && (
+              <p class="fine page-diagnostic" role="status">
+                {state.diagnostics.message}
+              </p>
+            )}
           {state.error && (
             <div class="error ai-error" role="alert" aria-live="assertive">
               <strong>AI 判断暂不可用</strong>
@@ -521,7 +546,7 @@ function App() {
         <div class="header-right">
           <span class="protection-status">
             <span />
-            热点入口保护{config.blockFeeds ? '已开启' : '已暂停'}
+            {config.blockFeeds ? '已开启' : '已暂停'}
           </span>
           <button class="settings-button" onClick={() => openSettings()}>
             <Icon name="settings" size={18} />

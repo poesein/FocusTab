@@ -12,7 +12,7 @@ const bundle = (
     absWorkingDir: root,
     stdin: {
       contents:
-        "import './src/app.jsx'; import { render } from 'preact'; import { request } from './src/bridge.mjs'; globalThis.testRequest = request; globalThis.disposeUI = () => render(null, document.getElementById('app'));",
+        "import './src/app.jsx'; import { render } from 'preact'; import { request, reportPopupFocus } from './src/bridge.mjs'; globalThis.testRequest = request; globalThis.testReportPopupFocus = reportPopupFocus; globalThis.disposeUI = () => render(null, document.getElementById('app'));",
       resolveDir: root,
       loader: 'js',
     },
@@ -34,9 +34,9 @@ async function until(predicate, description = 'UI update') {
   assert.fail(`Timed out waiting for ${description}`);
 }
 
-async function mount({ page = 'home', hash = '', setup = () => {} } = {}) {
+async function mount({ page = 'home', hash = '', url, setup = () => {} } = {}) {
   const dom = new JSDOM(`<body data-page="${page}"><div id="app"></div></body>`, {
-    url: `https://focus.test/${page === 'home' ? 'index' : page}.html${hash}`,
+    url: url || `https://focus.test/${page === 'home' ? 'index' : page}.html${hash}`,
     runScripts: 'dangerously',
     pretendToBeVisual: true,
   });
@@ -583,6 +583,220 @@ test('background automatic-status refresh does not replace an unsaved settings d
     await new Promise((resolve) => setTimeout(resolve, 50));
     assert.equal(field(window.document, '首页标题').value, '我的未保存标题');
     assert.equal(button(window.document, '保存设置').disabled, false);
+  } finally {
+    dom.window.disposeUI();
+    dom.window.close();
+  }
+});
+
+test('only a genuinely focused toolbar popup supplies owner-window proof, with blur and hidden revocation', async () => {
+  const calls = [],
+    state = {
+      config: structuredClone(DEFAULTS),
+      session: null,
+      current: null,
+      judgment: null,
+      checking: false,
+      feedback: [],
+    };
+  let focused = true,
+    visibility = 'visible',
+    ownerLookups = 0;
+  const dom = await mount({
+    page: 'popup',
+    url: 'chrome-extension://focus-ui-test/popup.html',
+    setup(window) {
+      extensionMock(window, state, calls);
+      window.document.hasFocus = () => focused;
+      Object.defineProperty(window.document, 'visibilityState', {
+        configurable: true,
+        get: () => visibility,
+      });
+      window.chrome.windows = {
+        async getCurrent() {
+          ownerLookups++;
+          return { id: 88, type: 'normal', incognito: false, focused: false };
+        },
+      };
+    },
+  });
+  try {
+    const { window } = dom;
+    const initial = calls.find((call) => call.type === 'focus:state');
+    assert.deepEqual(initial.uiFocus, { windowId: 88, visible: true, focused: true });
+    assert.deepEqual(initial.payload, {});
+    await window.testRequest('config', { title: '配置内容不含证明' });
+    const config = calls.find((call) => call.type === 'focus:config');
+    assert.deepEqual(config.payload, { title: '配置内容不含证明' });
+    assert.deepEqual(config.uiFocus, { windowId: 88, visible: true, focused: true });
+
+    window.dispatchEvent(new window.Event('blur'));
+    await until(() =>
+      calls.some((call) => call.type === 'focus:ui-state' && call.uiFocus?.focused === false)
+    );
+    await window.testRequest('state');
+    assert.equal(
+      calls.at(-1).uiFocus.focused,
+      false,
+      'blur revokes even before hasFocus catches up'
+    );
+    focused = false;
+    window.dispatchEvent(new window.Event('focus'));
+    await window.testReportPopupFocus(true);
+    assert.equal(
+      calls.at(-1).uiFocus.focused,
+      false,
+      'a focus event cannot substitute for document.hasFocus'
+    );
+    focused = true;
+    await window.testReportPopupFocus(true);
+    assert.equal(calls.at(-1).uiFocus.focused, true);
+
+    visibility = 'hidden';
+    window.document.dispatchEvent(new window.Event('visibilitychange'));
+    await until(() => calls.at(-1)?.uiFocus?.visible === false);
+    assert.equal(calls.at(-1).uiFocus.focused, false);
+    visibility = 'visible';
+    window.document.dispatchEvent(new window.Event('visibilitychange'));
+    await until(() => calls.at(-1)?.uiFocus?.focused === true);
+    const before = calls.length;
+    window.disposeUI();
+    await until(() => calls.length > before);
+    assert.equal(calls.at(-1).type, 'focus:ui-state');
+    assert.equal(calls.at(-1).uiFocus.focused, false, 'closing the popup revokes its proof');
+    assert.equal(ownerLookups, 1, 'only identity is cached, not focus');
+  } finally {
+    dom.window.disposeUI();
+    dom.window.close();
+  }
+});
+
+test('new tabs, settings and web previews never report popup focus metadata', async () => {
+  for (const url of [
+    'chrome-extension://focus-ui-test/index.html',
+    'chrome-extension://focus-ui-test/index.html#settings',
+    'https://focus.test/popup.html',
+  ]) {
+    const calls = [],
+      state = {
+        config: structuredClone(DEFAULTS),
+        session: null,
+        current: null,
+        judgment: null,
+        checking: false,
+        feedback: [],
+      };
+    let ownerLookups = 0;
+    const dom = await mount({
+      page: url.includes('popup.html') ? 'popup' : 'home',
+      url,
+      setup(window) {
+        extensionMock(window, state, calls);
+        window.document.hasFocus = () => true;
+        window.chrome.windows = {
+          async getCurrent() {
+            ownerLookups++;
+            return { id: 88, type: 'normal' };
+          },
+        };
+      },
+    });
+    try {
+      await dom.window.testReportPopupFocus(true);
+      await dom.window.testRequest('state');
+      assert.equal(
+        calls.some((call) => Object.hasOwn(call, 'uiFocus')),
+        false,
+        url
+      );
+      assert.equal(
+        calls.some((call) => call.type === 'focus:ui-state'),
+        false,
+        url
+      );
+      assert.equal(ownerLookups, 0, url);
+    } finally {
+      dom.window.disposeUI();
+      dom.window.close();
+    }
+  }
+});
+
+test('old or unavailable window APIs and non-normal owners preserve the ordinary message path', async () => {
+  for (const owner of [
+    undefined,
+    'reject',
+    { id: 88, type: 'popup' },
+    { id: 88, type: 'normal', incognito: true },
+    { id: -1, type: 'normal' },
+  ]) {
+    const calls = [],
+      state = {
+        config: structuredClone(DEFAULTS),
+        session: null,
+        current: null,
+        judgment: null,
+        checking: false,
+        feedback: [],
+      };
+    const dom = await mount({
+      page: 'popup',
+      url: 'chrome-extension://focus-ui-test/popup.html',
+      setup(window) {
+        extensionMock(window, state, calls);
+        window.document.hasFocus = () => true;
+        if (owner !== undefined)
+          window.chrome.windows = {
+            async getCurrent() {
+              if (owner === 'reject') throw new Error('Window API unavailable');
+              return owner;
+            },
+          };
+      },
+    });
+    try {
+      await dom.window.testRequest('state');
+      assert.equal(
+        calls.some((call) => Object.hasOwn(call, 'uiFocus')),
+        false
+      );
+      assert.equal(dom.window.document.querySelector('.popup') !== null, true);
+      assert.equal(dom.window.document.querySelector('.home-alerts .error:not([hidden])'), null);
+    } finally {
+      dom.window.disposeUI();
+      dom.window.close();
+    }
+  }
+});
+
+test('a popup blur while its owner lookup is pending cannot renew a stale focused proof', async () => {
+  const calls = [],
+    state = {
+      config: structuredClone(DEFAULTS),
+      session: null,
+      current: null,
+      judgment: null,
+      checking: false,
+      feedback: [],
+    };
+  const dom = await mount({
+    page: 'popup',
+    url: 'chrome-extension://focus-ui-test/popup.html',
+    setup(window) {
+      extensionMock(window, state, calls);
+      window.document.hasFocus = () => true;
+      window.chrome.windows = {
+        async getCurrent() {
+          await Promise.resolve();
+          window.dispatchEvent(new window.Event('blur'));
+          return { id: 88, type: 'normal', incognito: false };
+        },
+      };
+    },
+  });
+  try {
+    assert.ok(calls.some((call) => call.type === 'focus:ui-state'));
+    assert.ok(calls.every((call) => call.uiFocus?.focused === false));
   } finally {
     dom.window.disposeUI();
     dom.window.close();

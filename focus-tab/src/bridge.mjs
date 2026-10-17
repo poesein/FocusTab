@@ -2,6 +2,58 @@ import { loadConfig, validatePatch } from './config.mjs';
 import { resolveSearch } from './search.mjs';
 export const isExtension = !!globalThis.chrome?.runtime?.id;
 
+let popupInactive = false;
+let popupWindow;
+
+function isRealPopup() {
+  return (
+    isExtension &&
+    globalThis.top === globalThis &&
+    location.href === chrome.runtime.getURL('popup.html')
+  );
+}
+
+async function popupFocusProof() {
+  if (
+    !isRealPopup() ||
+    typeof document.hasFocus !== 'function' ||
+    typeof chrome.windows?.getCurrent !== 'function'
+  )
+    return null;
+  try {
+    // A toolbar popup belongs to one normal browser window for its lifetime.
+    // Cache only its identity, never the focus state. Read focus after the
+    // asynchronous lookup so a preceding blur cannot renew a stale proof.
+    popupWindow ||= Promise.resolve(chrome.windows.getCurrent());
+    const owner = await popupWindow;
+    if (
+      !owner ||
+      owner.type !== 'normal' ||
+      owner.incognito === true ||
+      !Number.isInteger(owner.id) ||
+      owner.id < 0
+    )
+      return null;
+    const visible = document.visibilityState === 'visible';
+    return {
+      windowId: owner.id,
+      visible,
+      focused: !popupInactive && visible && document.hasFocus(),
+    };
+  } catch {
+    popupWindow = null;
+    return null;
+  }
+}
+
+export async function reportPopupFocus(focused) {
+  if (!isRealPopup()) return null;
+  // The latch also invalidates other requests already waiting for getCurrent.
+  // A focus event permits a fresh proof but never substitutes for hasFocus().
+  popupInactive = focused !== true;
+  return request('ui-state');
+}
+
 function readPreviewValue(key, fallback = null) {
   try {
     return JSON.parse(localStorage.getItem(key) || 'null') ?? fallback;
@@ -34,7 +86,10 @@ export function openSettingsPage(section = 'appearance') {
 
 export async function request(type, payload = {}) {
   if (isExtension) {
-    const reply = await chrome.runtime.sendMessage({ type: 'focus:' + type, payload });
+    const message = { type: 'focus:' + type, payload };
+    const uiFocus = await popupFocusProof();
+    if (uiFocus) message.uiFocus = uiFocus;
+    const reply = await chrome.runtime.sendMessage(message);
     if (!reply?.ok) throw new Error(reply?.error || '扩展后台未响应，请在扩展管理页重新加载');
     return reply.data;
   }

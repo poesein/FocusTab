@@ -10,6 +10,7 @@ import {
 } from "./rules.mjs";
 import { classify, probe } from "./ai.mjs";
 import { resolveSearch } from "./search.mjs";
+import { applyInitialActionPreset } from "./deployment.mjs";
 
 export class FocusEngine {
   constructor(api, enqueue, now = () => Date.now(), ai = classify) {
@@ -34,9 +35,14 @@ export class FocusEngine {
     this.feedback = [];
     this.config = loadConfig();
     this.pending = null;
+    this.popupFocus = null;
+    this.focusTransition = null;
+    this.focusTimer = null;
+    this.lastEngaged = null;
+    this.currentCandidate = null;
   }
   async init() {
-    const [local, volatile] = await Promise.all([
+    const [stored, volatile] = await Promise.all([
       this.api.storage.local.get([
         "focusConfig",
         "focusSession",
@@ -44,6 +50,7 @@ export class FocusEngine {
       ]),
       this.api.storage.session.get("focusRuntime"),
     ]);
+    const local = await applyInitialActionPreset(this.api, stored);
     this.config = loadConfig(local.focusConfig);
     this.session = local.focusSession || null;
     this.feedback = (local.focusFeedback || [])
@@ -114,6 +121,83 @@ export class FocusEngine {
   cancelPending() {
     this.pending?.controller.abort();
     this.pending = null;
+  }
+  acceptUIFocus(message, sender) {
+    if (
+      sender.id !== this.api.runtime.id ||
+      sender.url !== this.api.runtime.getURL("popup.html") ||
+      (Number.isInteger(sender.frameId) && sender.frameId !== 0) ||
+      ![
+        "focus:state",
+        "focus:check",
+        "focus:feedback",
+        "focus:ui-state",
+      ].includes(message.type)
+    )
+      return false;
+    const proof = message.uiFocus;
+    if (
+      !proof ||
+      typeof proof.focused !== "boolean" ||
+      typeof proof.visible !== "boolean"
+    )
+      return false;
+    const now = this.now();
+    if (proof.focused && proof.visible) {
+      if (!Number.isInteger(proof.windowId) || proof.windowId < 0) return false;
+      this.popupFocus = {
+        windowId: proof.windowId,
+        documentId: sender.documentId || null,
+        receivedAt: now,
+        until: now + 2500,
+      };
+      this.focusTransition = null;
+      clearTimeout(this.focusTimer);
+      return true;
+    }
+    // A late blur message from a previously closed popup cannot revoke a new
+    // popup's proof. Never trust a timestamp supplied by the document itself.
+    if (
+      this.popupFocus?.documentId &&
+      sender.documentId &&
+      this.popupFocus.documentId !== sender.documentId
+    )
+      return false;
+    if (
+      this.popupFocus?.until > now &&
+      this.lastEngaged?.windowId === this.popupFocus.windowId
+    ) {
+      this.focusTransition = { ...this.lastEngaged, until: now + 1000 };
+      clearTimeout(this.focusTimer);
+      this.focusTimer = setTimeout(() => {
+        this.enqueue(() => this.refreshCurrentPage());
+      }, 1010);
+      this.focusTimer?.unref?.();
+    }
+    this.popupFocus = null;
+    return true;
+  }
+  sameFocusTransition(tab = this.currentCandidate) {
+    const transition = this.focusTransition;
+    return (
+      !!tab &&
+      transition?.until > this.now() &&
+      transition.windowId === tab.windowId &&
+      transition.identity ===
+        JSON.stringify([tab.id, tab.url, tab.title || ""]) &&
+      this.runtime.diagnostics?.idleState === "active" &&
+      canAnalyze(tab.url, this.config)
+    );
+  }
+  preservePendingDuringTransition() {
+    const context = this.effectiveContext();
+    return (
+      !!this.pending &&
+      this.sameFocusTransition() &&
+      this.pending.identity === this.focusTransition.identity &&
+      this.pending.contextId === context?.id &&
+      this.pending.mode === context?.mode
+    );
   }
   effectiveContext() {
     if (this.session?.ends > this.now())
@@ -283,7 +367,8 @@ export class FocusEngine {
       });
     else await this.api.alarms.clear("focus-expiry");
   }
-  async foreground() {
+  async foreground({ allowTransition = false } = {}) {
+    this.currentCandidate = null;
     const diagnostics = {
       code: "checking",
       message: "正在读取当前普通浏览器窗口。",
@@ -294,6 +379,8 @@ export class FocusEngine {
       hasURL: false,
       checkedAt: this.now(),
       eligible: false,
+      popupFocused: false,
+      focusSource: "none",
     };
     const finish = (code, message, tab = null) => {
       this.runtime.diagnostics = {
@@ -364,16 +451,44 @@ export class FocusEngine {
           "missing-tab-id",
           "浏览器未返回有效标签页编号，暂时不能检查此页面。"
         );
+      this.currentCandidate = tab;
       stage = "idle";
       diagnostics.idleState = await this.api.idle.queryState(
         this.config.idleSeconds
       );
-      if (!diagnostics.windowFocused)
+      diagnostics.popupFocused =
+        this.popupFocus?.windowId === win.id &&
+        this.popupFocus.until > this.now();
+      diagnostics.focusSource = diagnostics.windowFocused
+        ? "window"
+        : diagnostics.popupFocused
+        ? "popup"
+        : "none";
+      if (!diagnostics.windowFocused && !diagnostics.popupFocused) {
+        // This grace can only finish an already-started same-page operation.
+        // It is never used when deciding to send a new request to the NAS.
+        if (
+          allowTransition &&
+          diagnostics.idleState === "active" &&
+          this.focusTransition?.until > this.now() &&
+          this.focusTransition.windowId === win.id &&
+          this.focusTransition.identity ===
+            JSON.stringify([tab.id, tab.url, tab.title || ""]) &&
+          canAnalyze(tab.url, this.config)
+        ) {
+          diagnostics.focusSource = "transition";
+          return finish(
+            "ready",
+            "弹窗关闭后的短暂焦点切换；仅保留同一网页的在途判断。",
+            tab
+          );
+        }
         return finish(
           "unfocused",
           "已找到最近普通窗口的网页，但该窗口当前没有焦点；回到网页后才自动判断。",
           tab
         );
+      }
       if (diagnostics.idleState !== "active")
         return finish(
           "idle",
@@ -382,9 +497,15 @@ export class FocusEngine {
             : "浏览器检测到电脑暂时空闲；回到网页操作后继续判断。",
           tab
         );
+      this.lastEngaged = {
+        windowId: win.id,
+        identity: JSON.stringify([tab.id, tab.url, tab.title || ""]),
+      };
       return finish(
         "ready",
-        "已取得当前普通窗口网页，满足前台与活跃条件。",
+        diagnostics.focusSource === "popup"
+          ? "专注弹窗当前有焦点，已确认其所属普通窗口的当前网页。"
+          : "已取得当前普通窗口网页，满足前台与活跃条件。",
         tab
       );
     } catch {
@@ -424,7 +545,7 @@ export class FocusEngine {
     // Deliberately no saveRuntime: popup polling plus storage.onChanged would
     // otherwise form a read -> write -> read loop. No AI or navigation here.
     const tab = await this.foreground();
-    this.updateActive(tab);
+    if (tab || !this.preservePendingDuringTransition()) this.updateActive(tab);
   }
   async reconcile({ analyze = true } = {}) {
     const now = this.now();
@@ -439,6 +560,10 @@ export class FocusEngine {
     }
     const old = this.runtime.active;
     if (!tab) {
+      if (this.preservePendingDuringTransition()) {
+        await this.saveRuntime();
+        return;
+      }
       this.cancelPending();
       this.runtime.active = null;
       this.runtime.judgment = null;
@@ -517,13 +642,13 @@ export class FocusEngine {
     if (keep.length !== focusPasses.length)
       await this.api.storage.session.set({ focusPasses: keep });
   }
-  async contextIsCurrent(context, active) {
+  async contextIsCurrent(context, active, allowTransition = false) {
     const current = this.effectiveContext();
     if (!current || current.id !== context.id || current.mode !== context.mode)
       return false;
     let tab;
     try {
-      tab = await this.foreground();
+      tab = await this.foreground({ allowTransition });
     } catch {
       return false;
     }
@@ -679,6 +804,7 @@ export class FocusEngine {
       .catch((error) =>
         this.enqueue(async () => {
           if (!(await this.isCurrent(pending))) return;
+          if (error.name === "FocusChangedError") return;
           this.runtime.error =
             error.name === "AbortError"
               ? "AI 请求已超时；资料页保持开放，网址规则继续生效。"
@@ -702,7 +828,7 @@ export class FocusEngine {
       context.mode !== pending.mode
     )
       return false;
-    return this.contextIsCurrent(context, pending);
+    return this.contextIsCurrent(context, pending, true);
   }
   async readAndClassify(config, goal, active, signal) {
     let page = {
@@ -729,6 +855,11 @@ export class FocusEngine {
         // Restricted pages/injection errors don't imply unrelated content.
       }
     }
+    if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+    // Extraction may have raced a focus, tab, task or privacy change. Recheck
+    // without transition grace before sending any newly captured page text.
+    if (!(await this.contextIsCurrent(goal, active)))
+      throw new DOMException("Page no longer active", "FocusChangedError");
     if (signal.aborted) throw new DOMException("Aborted", "AbortError");
     const result = await this.ai(config, goal, page, signal);
     return {
@@ -792,7 +923,9 @@ export class FocusEngine {
     )
       throw new Error("消息格式无效");
     if (JSON.stringify(message).length > 40000) throw new Error("消息过长");
+    const acceptedFocus = this.acceptUIFocus(message, sender);
     const { type, payload = {} } = message;
+    if (type === "focus:ui-state") return { accepted: acceptedFocus };
     if (type === "focus:state") {
       await this.refreshCurrentPage();
       return this.snapshot();
