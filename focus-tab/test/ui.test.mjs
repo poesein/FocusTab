@@ -1326,10 +1326,13 @@ test('cooldown counts down locally and expiry only rechecks the backend before e
     const { document } = dom.window;
     await until(() => document.querySelector('.pass-countdown')?.textContent.includes('10 秒'));
     assert.equal(button(document, '仅此页放行 10 分钟').disabled, true);
+    const applicationTime = document.querySelector('.pass-budget time');
+    assert.equal(applicationTime?.dateTime, new Date(budget.nextAvailableAt).toISOString());
     const before = calls.length;
     instant += 5_000;
     timers.find((timer) => timer.delay === 1000).callback();
     await until(() => document.querySelector('.pass-countdown')?.textContent.includes('5 秒'));
+    assert.equal(document.querySelector('.pass-budget time')?.dateTime, applicationTime.dateTime);
     assert.equal(calls.length, before, 'a local countdown tick does not poll');
     instant += 5_000;
     timers.find((timer) => timer.delay === 1000).callback();
@@ -1345,6 +1348,7 @@ test('cooldown counts down locally and expiry only rechecks the backend before e
     budget.reason = '';
     timers.find((timer) => timer.delay === 2000).callback();
     await until(() => !button(document, '仅此页放行 10 分钟').disabled);
+    assert.equal(document.querySelector('.pass-budget time'), null);
     assert.equal(
       calls.some((call) => call.type === 'focus:check' || call.type === 'focus:pass'),
       false
@@ -1724,6 +1728,76 @@ test('an already available pass does not repeatedly refresh as its immediate nex
     assert.equal(calls.at(-1).type, 'focus:blocked');
     assert.equal(
       calls.some((call) => call.type === 'focus:check' || call.type === 'focus:pass'),
+      false
+    );
+  } finally {
+    dom.window.disposeUI();
+    dom.window.close();
+  }
+});
+
+test('an immediately available pass never flashes a future application time between polling and clock ticks', async () => {
+  let instant = 1_800_000_000_000;
+  const timers = [],
+    calls = [],
+    budget = {
+      enabled: true,
+      dailyLimitMinutes: 20,
+      usedMinutes: 0,
+      remainingMinutes: 20,
+      cooldownMinutes: 10,
+      cooldownUntil: 0,
+      waitSeconds: 0,
+      nextAvailableAt: instant + 50,
+      canGrant: true,
+      grantMinutes: 10,
+      reason: '本次可放行 10 分钟，批准即计入今日共享额度，提前结束不退回。',
+    };
+  const state = {
+    config: structuredClone(DEFAULTS),
+    session: null,
+    current: null,
+    judgment: null,
+    checking: false,
+    feedback: [],
+    passBudget: budget,
+  };
+  const dom = await mount({
+    page: 'blocked',
+    setup(window) {
+      extensionMock(window, state, calls);
+      window.Date.now = () => instant;
+      window.setInterval = (callback, delay) => {
+        timers.push({ callback, delay });
+        return timers.length;
+      };
+      window.clearInterval = () => {};
+    },
+  });
+  try {
+    const { document } = dom.window;
+    await until(() => !button(document, '仅此页放行 10 分钟')?.disabled);
+    const assertAvailable = () => {
+      assert.equal(button(document, '仅此页放行 10 分钟').disabled, false);
+      assert.match(document.querySelector('.pass-budget').textContent, /本次可放行 10 分钟/);
+      assert.equal(document.querySelector('.pass-budget time'), null);
+      assert.doesNotMatch(document.querySelector('.pass-budget').textContent, /下次可申请/);
+    };
+    assertAvailable();
+    for (let step = 0; step < 3; step++) {
+      instant += 2_000;
+      budget.nextAvailableAt = instant + 50;
+      const before = calls.length;
+      timers.find((timer) => timer.delay === 2000).callback();
+      await until(() => calls.length > before);
+      await new Promise((resolve) => setTimeout(resolve, 35));
+      assertAvailable();
+      timers.find((timer) => timer.delay === 1000).callback();
+      await new Promise((resolve) => setTimeout(resolve, 35));
+      assertAvailable();
+    }
+    assert.equal(
+      calls.some((call) => ['focus:pass', 'focus:check'].includes(call.type)),
       false
     );
   } finally {

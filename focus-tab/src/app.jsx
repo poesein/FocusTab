@@ -273,21 +273,25 @@ function PassBudgetInfo({ budget, now, reused }) {
       {!reused && !budget.canGrant && cooldown === 0 && budget.remainingMinutes !== 0 && (
         <p>正在核验最新放行额度…</p>
       )}
-      {Number.isFinite(budget.nextAvailableAt) && budget.nextAvailableAt > now && (
-        <p>
-          下次可申请：
-          <time dateTime={new Date(budget.nextAvailableAt).toISOString()}>
-            {new Date(budget.nextAvailableAt).toLocaleString('zh-CN', {
-              month: 'numeric',
-              day: 'numeric',
-              hour: '2-digit',
-              minute: '2-digit',
-              second: '2-digit',
-              hour12: false,
-            })}
-          </time>
-        </p>
-      )}
+      {/* An available budget's timestamp is the backend's current time. It can
+          be newer than our one-second UI clock without representing a wait. */}
+      {!budget.canGrant &&
+        Number.isFinite(budget.nextAvailableAt) &&
+        budget.nextAvailableAt > now && (
+          <p>
+            下次可申请：
+            <time dateTime={new Date(budget.nextAvailableAt).toISOString()}>
+              {new Date(budget.nextAvailableAt).toLocaleString('zh-CN', {
+                month: 'numeric',
+                day: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+                hour12: false,
+              })}
+            </time>
+          </p>
+        )}
       {reused && <p>沿用当前放行截止时间，不会重新扣减额度或延长。</p>}
     </section>
   );
