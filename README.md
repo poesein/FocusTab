@@ -1,6 +1,6 @@
 # FocusTab · 专注
 
-此 fork 的开发入口是 **[focus-tab/](focus-tab/README.md)**：中文新标签页、页面任务相关性判断、浏览器原生规则拦截。它是一个独立构建的 Chrome / Edge 扩展，无需 ActivityWatch 或桌面记录服务，使用单独的 Manifest 和依赖。源码和构建工作流见 [poesein/FocusTab](https://github.com/poesein/FocusTab)。
+此 fork 的开发入口是 **[focus-tab/](focus-tab/README.md)**：中文新标签页、页面任务相关性判断、浏览器原生规则拦截。它是一个独立构建的 Chrome / Edge 扩展，使用单独的 Manifest 和依赖。源码和构建工作流见 [poesein/FocusTab](https://github.com/poesein/FocusTab)。
 
 在 `focus-tab` 中运行 `npm ci && npm test && npm run build`，然后在浏览器开发人员模式中加载生成的 `focus-tab/dist`。安装说明、权限与数据流、AI 配置和局限见该目录的中文 README。
 
