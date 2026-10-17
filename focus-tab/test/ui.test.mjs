@@ -466,6 +466,52 @@ test('automatic mode setting persists without replacing a saved reminder prefere
   }
 });
 
+test('popup explains missing pages and exposes the installed version and actual action', async () => {
+  const calls = [],
+    state = {
+      config: { ...structuredClone(DEFAULTS), aiAction: 'remind' },
+      version: '0.1.2',
+      session: null,
+      current: null,
+      judgment: null,
+      checking: false,
+      feedback: [],
+      calls: 3,
+      status: { mode: 'auto', code: 'no-page', message: '等待普通网页' },
+      diagnostics: {
+        code: 'window-unfocused',
+        message: '浏览器窗口未在前台，请返回网页后重新识别。',
+        checkedAt: Date.now(),
+      },
+    };
+  const dom = await mount({
+    page: 'popup',
+    setup(window) {
+      extensionMock(window, state, calls);
+    },
+  });
+  try {
+    const { document } = dom.window;
+    assert.equal(document.querySelector('.popup-version').textContent, 'v0.1.2');
+    assert.match(document.querySelector('.page-diagnostic').textContent, /窗口未在前台/);
+    assert.match(document.querySelector('.judgment').textContent, /等待识别普通网页/);
+    assert.match(document.querySelector('.runtime-details').textContent, /仅提醒/);
+    assert.match(document.querySelector('.runtime-details').textContent, /3 \/ 12/);
+    assert.equal(button(document, '检查当前页面').disabled, true);
+    const count = calls.length;
+    button(document, '重新识别页面（不请求 AI）').click();
+    await until(() => calls.length > count);
+    assert.equal(calls.at(-1).type, 'focus:state');
+    assert.equal(
+      calls.some((row) => row.type === 'focus:check'),
+      false
+    );
+  } finally {
+    dom.window.disposeUI();
+    dom.window.close();
+  }
+});
+
 test('automatic AI blocks can be corrected without a task and do not silently pass the page', async () => {
   const calls = [],
     state = {

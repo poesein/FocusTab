@@ -247,7 +247,12 @@ function App() {
   const activeSession = Boolean(session && session.ends > now);
   const automatic = Boolean(config.autoClassify && !activeSession);
   const hasContext = Boolean(config.autoClassify || activeSession);
-  const canJudge = Boolean(hasContext && state.current && state.status?.code !== 'excluded');
+  const canJudge = Boolean(
+    hasContext &&
+      state.current &&
+      state.status?.code !== 'excluded' &&
+      state.diagnostics?.eligible !== false
+  );
   const judgmentLabels = automatic
     ? { ...labels, related: '工作或学习', unrelated: '娱乐或消遣' }
     : labels;
@@ -381,6 +386,7 @@ function App() {
       <main class="popup">
         <header>
           <Logo brand={config.brand} />
+          <span class="popup-version">v{state.version || '开发版'}</span>
           <button class="icon-button" aria-label="打开设置" onClick={openSettingsPage}>
             <Icon name="settings" />
           </button>
@@ -399,6 +405,8 @@ function App() {
                   : '正在对照研究目标…'
                 : judgment
                 ? judgmentLabels[judgment.label]
+                : !state.current
+                ? '等待识别普通网页'
                 : config.autoClassify
                 ? '等待页面稳定停留'
                 : activeSession
@@ -424,6 +432,11 @@ function App() {
               {checkStatus}
             </p>
           )}
+          {!state.current && state.diagnostics?.message && (
+            <p class="fine page-diagnostic" role="status">
+              {state.diagnostics.message}
+            </p>
+          )}
           {state.error && (
             <div class="error ai-error" role="alert" aria-live="assertive">
               <strong>AI 判断暂不可用</strong>
@@ -443,7 +456,27 @@ function App() {
             检查当前页面
           </Button>
           <small class="fine block">手动检查可跳过稳定停留等待，仍遵守最小间隔和每小时限额。</small>
+          {!state.current && (
+            <button class="text-button" disabled={busy} onClick={refresh}>
+              重新识别页面（不请求 AI）
+            </button>
+          )}
         </section>
+        <details class="runtime-details">
+          <summary>运行信息</summary>
+          <p>
+            版本 {state.version || '开发版'} ·{' '}
+            {config.aiAction === 'block' ? '高置信度拦截' : '仅提醒'}
+          </p>
+          <p>
+            本小时 AI 请求 {state.calls || 0} / {config.requestsPerHour}
+          </p>
+          <p>页面状态：{state.diagnostics?.code || state.status?.code || '等待检测'}</p>
+          {state.diagnostics?.checkedAt && (
+            <p>检测时间：{new Date(state.diagnostics.checkedAt).toLocaleTimeString('zh-CN')}</p>
+          )}
+          {state.diagnostics?.message && <p>{state.diagnostics.message}</p>}
+        </details>
         <section class="feedback">
           <span class="eyebrow">判断不合适？</span>
           <div class="feedback-buttons">

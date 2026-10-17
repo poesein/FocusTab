@@ -21,6 +21,8 @@ export class FocusEngine {
       autoSessionId: "auto:" + crypto.randomUUID(),
       contextToken: null,
       active: null,
+      observed: null,
+      diagnostics: null,
       calls: [],
       lastAI: 0,
       judgment: null,
@@ -86,7 +88,9 @@ export class FocusEngine {
         .map((r) => r.id),
     });
     await this.api.alarms.create("focus-check", { periodInMinutes: 0.5 });
-    await this.reconcile();
+    // Startup can be caused by a read-only popup state request. Restore local
+    // state without using the NAS; normal browser/alarm events run analysis.
+    await this.reconcile({ analyze: false });
   }
   async saveRuntime() {
     await this.api.storage.session.set({ focusRuntime: this.runtime });
@@ -280,15 +284,149 @@ export class FocusEngine {
     else await this.api.alarms.clear("focus-expiry");
   }
   async foreground() {
-    const win = await this.api.windows.getLastFocused();
-    if (!win?.focused || win.incognito) return null;
-    const idle = await this.api.idle.queryState(this.config.idleSeconds);
-    if (idle !== "active") return null;
-    const [tab] = await this.api.tabs.query({ active: true, windowId: win.id });
-    if (!tab || tab.incognito || !httpURL(tab.url)) return null;
-    return tab;
+    const diagnostics = {
+      code: "checking",
+      message: "正在读取当前普通浏览器窗口。",
+      windowId: null,
+      windowFocused: null,
+      idleState: null,
+      tabId: null,
+      hasURL: false,
+      checkedAt: this.now(),
+      eligible: false,
+    };
+    const finish = (code, message, tab = null) => {
+      this.runtime.diagnostics = {
+        ...diagnostics,
+        code,
+        message,
+        eligible: code === "ready",
+      };
+      this.runtime.observed = tab
+        ? { url: cleanURL(tab.url), title: (tab.title || "").slice(0, 300) }
+        : null;
+      return code === "ready" ? tab : null;
+    };
+    let stage = "window";
+    try {
+      // The API otherwise includes popup browser windows. An extension/tool
+      // popup is not a replacement for the user's normal browsing window.
+      const win = await this.api.windows.getLastFocused({
+        windowTypes: ["normal"],
+      });
+      if (!win || !Number.isInteger(win.id))
+        return finish(
+          "no-window",
+          "没有找到普通浏览器窗口。请在普通窗口打开网页。"
+        );
+      diagnostics.windowId = win.id;
+      diagnostics.windowFocused = win.focused === true;
+      if (win.incognito)
+        return finish(
+          "incognito",
+          "无痕窗口不参与内容判断，也不读取页面信息。"
+        );
+      if (win.type && win.type !== "normal")
+        return finish(
+          "unsupported-window",
+          "当前返回的是弹出式或工具窗口，尚未取得普通网页。"
+        );
+      stage = "tabs";
+      const tabs = await this.api.tabs.query({
+        active: true,
+        windowId: win.id,
+      });
+      const tab = Array.isArray(tabs) ? tabs[0] : null;
+      if (!tab)
+        return finish(
+          "no-tab",
+          "普通窗口未返回当前标签页。请切换到网页后重新打开面板。"
+        );
+      diagnostics.tabId = Number.isInteger(tab.id) ? tab.id : null;
+      if (tab.incognito)
+        return finish(
+          "incognito",
+          "无痕标签页不参与内容判断，也不读取页面信息。"
+        );
+      diagnostics.hasURL = typeof tab.url === "string" && !!tab.url;
+      if (!diagnostics.hasURL)
+        return finish(
+          "missing-url",
+          "浏览器没有返回当前标签页网址。请检查扩展的网站访问权限，并刷新网页。"
+        );
+      if (!httpURL(tab.url))
+        return finish(
+          "unsupported-page",
+          "当前是新标签页、扩展设置或浏览器内部页面；请在普通网页中打开工具栏面板。"
+        );
+      if (!Number.isInteger(tab.id))
+        return finish(
+          "missing-tab-id",
+          "浏览器未返回有效标签页编号，暂时不能检查此页面。"
+        );
+      stage = "idle";
+      diagnostics.idleState = await this.api.idle.queryState(
+        this.config.idleSeconds
+      );
+      if (!diagnostics.windowFocused)
+        return finish(
+          "unfocused",
+          "已找到最近普通窗口的网页，但该窗口当前没有焦点；回到网页后才自动判断。",
+          tab
+        );
+      if (diagnostics.idleState !== "active")
+        return finish(
+          "idle",
+          diagnostics.idleState === "locked"
+            ? "电脑处于锁定状态，暂不判断网页。"
+            : "浏览器检测到电脑暂时空闲；回到网页操作后继续判断。",
+          tab
+        );
+      return finish(
+        "ready",
+        "已取得当前普通窗口网页，满足前台与活跃条件。",
+        tab
+      );
+    } catch {
+      // Do not persist an API exception that might embed a page URL or other
+      // sensitive data. The failing API stage remains explicit and actionable.
+      return finish(
+        "api-error",
+        `读取${
+          { window: "普通窗口", tabs: "当前标签页", idle: "电脑活跃状态" }[
+            stage
+          ]
+        }失败（${stage} API）。请重新加载扩展后再试。`
+      );
+    }
   }
-  async reconcile() {
+  updateActive(tab) {
+    if (!tab) {
+      this.cancelPending();
+      this.runtime.active = null;
+      this.runtime.judgment = null;
+      return;
+    }
+    const identity = JSON.stringify([tab.id, tab.url, tab.title || ""]);
+    if (this.runtime.active?.identity !== identity) {
+      this.cancelPending();
+      this.runtime.judgment = null;
+      this.runtime.active = {
+        identity,
+        tabId: tab.id,
+        url: tab.url,
+        title: (tab.title || "").slice(0, 300),
+        since: this.now(),
+      };
+    }
+  }
+  async refreshCurrentPage() {
+    // Deliberately no saveRuntime: popup polling plus storage.onChanged would
+    // otherwise form a read -> write -> read loop. No AI or navigation here.
+    const tab = await this.foreground();
+    this.updateActive(tab);
+  }
+  async reconcile({ analyze = true } = {}) {
     const now = this.now();
     // Expiry enforcement must also run when Chrome is unfocused, idle, or the
     // foreground is an extension/new-tab page.
@@ -337,7 +475,7 @@ export class FocusEngine {
       };
       await this.api.action.setBadgeText({ text: "" });
     }
-    this.maybeAI();
+    if (analyze) this.maybeAI();
     await this.saveRuntime();
   }
   async currentPass(tabId, raw) {
@@ -621,9 +759,11 @@ export class FocusEngine {
       config: this.config,
       session: this.session,
       status: this.classificationStatus(),
-      current: active
-        ? { url: cleanURL(active.url), title: active.title }
-        : null,
+      current:
+        this.runtime.observed ||
+        (active ? { url: cleanURL(active.url), title: active.title } : null),
+      diagnostics: this.runtime.diagnostics,
+      version: this.api.runtime.getManifest?.().version || "dev",
       judgment: this.runtime.judgment,
       error: this.runtime.error,
       notice: this.runtime.notice,
@@ -653,7 +793,10 @@ export class FocusEngine {
       throw new Error("消息格式无效");
     if (JSON.stringify(message).length > 40000) throw new Error("消息过长");
     const { type, payload = {} } = message;
-    if (type === "focus:state") return this.snapshot();
+    if (type === "focus:state") {
+      await this.refreshCurrentPage();
+      return this.snapshot();
+    }
     if (type === "focus:config") {
       const patch = validatePatch(payload);
       const before = this.config;
