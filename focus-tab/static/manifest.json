@@ -1,0 +1,42 @@
+{
+  "manifest_version": 3,
+  "name": "FocusTab · 专注",
+  "short_name": "专注",
+  "description": "中文新标签页、科研任务相关性判断与热点入口拦截。数据在浏览器与您指定的本机或局域网 AI 之间处理。",
+  "version": "0.1.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwVRrO4SkB+1SKbJrRsTGGy7Gjbi9mNzS6FY26RHEN/Hx1I5zxhirgPT/NFL2uUUC0HeGmFPGDcInEW3guVhaURooDHUE2bHI7TI379oqIPlVKKdEpdzdYWeL2sDDdmwlvsYXyX0GGfk+JZbYXMM1QOsrBKAyuBFFLuSZ9TliEy5tz7XE1wAM7Jp145XpHUJP1hkmE+3o9DIFHK4xBm1XI53gpC0yPriB9q+B93YWEiXCULFEuTgAXFWMG+e/PtIOh7Llwd84ztal6yAqkVrR8hG06Iyg6+DcCKrT6oHLbifayryP9Y2pajQ9JK2VD++20OErUr78B5GXKMehXs7TvQIDAQAB",
+  "minimum_chrome_version": "120",
+  "incognito": "not_allowed",
+  "homepage_url": "https://github.com/poesein/FocusTab",
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "action": {
+    "default_title": "专注助手",
+    "default_popup": "popup.html",
+    "default_icon": { "16": "icons/icon-16.png", "32": "icons/icon-32.png" }
+  },
+  "background": { "service_worker": "background.js", "type": "module" },
+  "chrome_url_overrides": { "newtab": "index.html" },
+  "options_page": "index.html#settings",
+  "permissions": [
+    "tabs",
+    "storage",
+    "alarms",
+    "idle",
+    "webNavigation",
+    "scripting",
+    "notifications",
+    "declarativeNetRequest"
+  ],
+  "host_permissions": ["http://*/*", "https://*/*"],
+  "web_accessible_resources": [
+    { "resources": ["blocked.html", "app.js", "app.css"], "matches": ["http://*/*", "https://*/*"] }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+  }
+}

@@ -1,0 +1,87 @@
+import { loadConfig, validatePatch } from './config.mjs';
+import { resolveSearch } from './search.mjs';
+export const isExtension = !!globalThis.chrome?.runtime?.id;
+
+function readPreviewValue(key, fallback = null) {
+  try {
+    return JSON.parse(localStorage.getItem(key) || 'null') ?? fallback;
+  } catch {
+    // Stale or damaged preview storage must not prevent opening the UI.
+    return fallback;
+  }
+}
+
+function previewSession(value) {
+  return value &&
+    typeof value === 'object' &&
+    typeof value.id === 'string' &&
+    typeof value.goal === 'string' &&
+    value.goal.length <= 200 &&
+    Number.isFinite(value.started) &&
+    Number.isFinite(value.ends)
+    ? value
+    : null;
+}
+
+export function openSettingsPage() {
+  if (isExtension) return chrome.tabs.create({ url: chrome.runtime.getURL('index.html#settings') });
+  return globalThis.open(new URL('index.html#settings', location.href).href, '_blank', 'noopener');
+}
+
+export async function request(type, payload = {}) {
+  if (isExtension) {
+    const reply = await chrome.runtime.sendMessage({ type: 'focus:' + type, payload });
+    if (!reply?.ok) throw new Error(reply?.error || '扩展后台未响应，请在扩展管理页重新加载');
+    return reply.data;
+  }
+  // Explicit UI-only preview, never pretends to inspect or block other tabs.
+  const state = {
+    config: loadConfig(readPreviewValue('focus-preview-config')),
+    session: previewSession(readPreviewValue('focus-preview-session')),
+    current: null,
+    judgment: null,
+    error: '',
+    notice: '',
+    calls: 0,
+    feedback: [],
+    checking: false,
+  };
+  if (type === 'config') {
+    state.config = { ...state.config, ...validatePatch(payload) };
+    localStorage.setItem('focus-preview-config', JSON.stringify(state.config));
+  } else if (type === 'start' || type === 'search') {
+    const search = type === 'search' ? resolveSearch(payload.query || '') : null;
+    const rawGoal = search?.goal ?? payload.goal;
+    if (typeof rawGoal !== 'string') throw new Error('请填写 1–200 字研究目标');
+    const goal = rawGoal.trim();
+    if (!goal || goal.length > 200) throw new Error('请填写 1–200 字研究目标');
+    const minutes = payload.minutes ?? state.config.sessionMinutes;
+    validatePatch({ sessionMinutes: minutes });
+    if (
+      type === 'start' ||
+      state.config.newTaskPerSearch ||
+      !state.session ||
+      state.session.ends <= Date.now()
+    ) {
+      state.session = {
+        id: crypto.randomUUID(),
+        goal,
+        started: Date.now(),
+        ends: Date.now() + minutes * 6e4,
+      };
+      localStorage.setItem('focus-preview-session', JSON.stringify(state.session));
+    }
+    if (search) return { url: search.url };
+  } else if (type === 'extend') {
+    if (!state.session) throw new Error('请先开始一次研究');
+    state.session.ends =
+      Math.max(Date.now(), state.session.ends) + state.config.extendMinutes * 6e4;
+    localStorage.setItem('focus-preview-session', JSON.stringify(state.session));
+  } else if (type === 'end') {
+    state.session = null;
+    localStorage.removeItem('focus-preview-session');
+  } else if (!['state', 'config', 'start', 'end', 'extend'].includes(type)) {
+    throw new Error('这是界面预览；请加载扩展后使用内容判断、反馈和拦截');
+  }
+  return state;
+}

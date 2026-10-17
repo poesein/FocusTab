@@ -1,0 +1,22 @@
+{
+  "name": "focus-tab",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MPL-2.0",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test test/*.test.mjs",
+    "preview": "node scripts/preview.mjs"
+  },
+  "dependencies": {
+    "@mozilla/readability": "0.6.0",
+    "ollama": "0.6.4",
+    "preact": "11.0.1",
+    "sortablejs": "1.15.7"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "jsdom": "26.1.0"
+  }
+}

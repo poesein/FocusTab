@@ -1,0 +1,1236 @@
+import { render } from 'preact';
+import { useEffect, useRef, useState } from 'preact/hooks';
+import Sortable from 'sortablejs/modular/sortable.core.esm.js';
+import { request, isExtension, openSettingsPage } from './bridge.mjs';
+import { BUILTINS } from './rules.mjs';
+import { PRESETS, validatePatch } from './config.mjs';
+import { blockedPayload } from './blocked-location.mjs';
+
+const $ = (selector) => document.querySelector(selector);
+const labels = {
+  related: '与研究相关',
+  unrelated: '可能偏离目标',
+  uncertain: '信息不足，暂不判断',
+};
+const page =
+  document.body.dataset.page ||
+  (location.pathname.includes('popup')
+    ? 'popup'
+    : location.pathname.includes('blocked')
+    ? 'blocked'
+    : 'home');
+const glyphs = {
+  search: (
+    <>
+      <circle cx="10.5" cy="10.5" r="6.5" />
+      <path d="m16 16 4.5 4.5" />
+    </>
+  ),
+  settings: (
+    <>
+      <path d="M12 3v3m0 12v3M3 12h3m12 0h3M5.6 5.6l2.1 2.1m8.6 8.6 2.1 2.1m0-12.8-2.1 2.1m-8.6 8.6-2.1 2.1" />
+      <circle cx="12" cy="12" r="5" />
+    </>
+  ),
+  arrow: (
+    <>
+      <path d="M5 12h14m-5-5 5 5-5 5" />
+    </>
+  ),
+  close: <path d="m6 6 12 12M6 18 18 6" />,
+  shield: (
+    <>
+      <path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6l8-3Z" />
+      <path d="m8 12 3 3 5-6" />
+    </>
+  ),
+  clock: (
+    <>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 7v5l3 2" />
+    </>
+  ),
+  leaf: (
+    <>
+      <path d="M5 19C1 8 10 3 21 3c0 12-5 20-16 16Z" />
+      <path d="M3 21 16 8" />
+    </>
+  ),
+  plus: <path d="M12 5v14M5 12h14" />,
+  check: <path d="m5 12 4 4L20 5" />,
+};
+function Icon({ name, size = 20 }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.65"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      {glyphs[name] || glyphs.leaf}
+    </svg>
+  );
+}
+function Logo({ brand = '专注' }) {
+  return (
+    <span class="brand">
+      <span class="brand-mark">
+        <Icon name="leaf" size={19} />
+      </span>
+      {brand}
+    </span>
+  );
+}
+function Button({ children, icon, secondary, small, ...props }) {
+  return (
+    <button class={`button ${secondary ? 'secondary' : ''} ${small ? 'small' : ''}`} {...props}>
+      {icon && <Icon name={icon} size={17} />} {children}
+    </button>
+  );
+}
+function Field({ label, help, children }) {
+  return (
+    <label class="field">
+      <span class="field-title">{label}</span>
+      {children}
+      {help && <small>{help}</small>}
+    </label>
+  );
+}
+function Toggle({ label, help, value, onChange }) {
+  return (
+    <label class="toggle-field">
+      <span>
+        <span class="field-title">{label}</span>
+        {help && <small>{help}</small>}
+      </span>
+      <input
+        type="checkbox"
+        role="switch"
+        checked={value}
+        onChange={(e) => onChange(e.target.checked)}
+      />
+      <span class="switch" aria-hidden="true" />
+    </label>
+  );
+}
+function Timer({ session, now }) {
+  const seconds = Math.max(0, Math.ceil((session.ends - now) / 1000));
+  return (
+    <span class="timer">
+      <Icon name="clock" size={16} />
+      {seconds
+        ? `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(
+            2,
+            '0'
+          )}`
+        : '本轮已结束'}
+    </span>
+  );
+}
+function App() {
+  const [state, setState] = useState(null),
+    [error, setError] = useState(''),
+    [notice, setNotice] = useState('');
+  const [settings, setSettings] = useState(location.hash === '#settings'),
+    [section, setSection] = useState('appearance');
+  const [now, setNow] = useState(Date.now()),
+    [busy, setBusy] = useState(false),
+    [query, setQuery] = useState('');
+  const [goal, setGoal] = useState(''),
+    [remember, setRemember] = useState(false),
+    [blocked, setBlocked] = useState(null);
+  const input = useRef();
+  async function refresh() {
+    try {
+      setState(await request('state'));
+    } catch (e) {
+      setError(e.message);
+    }
+  }
+  useEffect(() => {
+    refresh();
+    const timer = setInterval(() => {
+      setNow(Date.now());
+      if (page === 'popup' && !document.hidden) refresh();
+    }, 2000);
+    const changed = () => {
+      if (!document.hidden) refresh();
+    };
+    document.addEventListener('visibilitychange', changed);
+    const storageChanged = (changes) => {
+      if (changes.focusSession || changes.focusConfig || changes.focusRuntime) refresh();
+    };
+    if (isExtension) chrome.storage.onChanged.addListener(storageChanged);
+    const key = (event) => {
+      if (
+        event.key === '/' &&
+        !document.querySelector('dialog[open]') &&
+        !/INPUT|TEXTAREA|SELECT/.test(document.activeElement?.tagName) &&
+        !document.activeElement?.isContentEditable
+      ) {
+        event.preventDefault();
+        input.current?.focus();
+      }
+    };
+    document.addEventListener('keydown', key);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', changed);
+      document.removeEventListener('keydown', key);
+      if (isExtension) chrome.storage.onChanged.removeListener(storageChanged);
+    };
+  }, []);
+  useEffect(() => {
+    if (!state) return;
+    document.title = page === 'blocked' ? '停一下 · 专注' : state.config.tabTitle;
+    document.documentElement.dataset.theme = state.config.theme;
+  }, [state?.config]);
+  useEffect(() => {
+    if (page !== 'blocked' || !isExtension) return;
+    request('blocked', blockedPayload(location.hash))
+      .then(setBlocked)
+      .catch((e) => setError(e.message));
+  }, []);
+  async function act(type, payload = {}, bubbleError = false) {
+    setBusy(true);
+    setError('');
+    setNotice('');
+    try {
+      const result = await request(type, payload);
+      if (result?.config) setState(result);
+      return result;
+    } catch (e) {
+      setError(e.message);
+      if (bubbleError) throw e;
+      return null;
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function saveConfig(patch) {
+    // Keep the rejection intact so a native modal can display the real error.
+    const result = await request('config', patch);
+    if (!result?.config) throw new Error('保存设置后未收到确认，请重试');
+    setState(result);
+    setError('');
+    setNotice('');
+    return result.config;
+  }
+  async function search(e) {
+    e.preventDefault();
+    const result = await act('search', { query });
+    if (result?.url) location.assign(result.url);
+  }
+  const openSettings = (name = 'appearance') => {
+    setSection(name);
+    setSettings(true);
+    setError('');
+  };
+  if (!state)
+    return (
+      <main class="loading">
+        <Logo />
+        <p role="status">正在准备你的专注空间…</p>
+        {error && <p class="error">{error}</p>}
+      </main>
+    );
+  const { config, session, judgment } = state;
+  const task = (
+    <div class="task-card">
+      <div class="task-heading">
+        <span class="eyebrow">当前研究</span>
+        {session && <Timer session={session} now={now} />}
+      </div>
+      {session ? (
+        <>
+          <strong class="task-goal">{session.goal}</strong>
+          <div class="task-actions">
+            <Button secondary small disabled={busy} onClick={() => act('extend')}>
+              续时 {config.extendMinutes} 分钟
+            </Button>
+            <button class="text-button" disabled={busy} onClick={() => act('end')}>
+              结束本轮
+            </button>
+          </div>
+        </>
+      ) : (
+        <form
+          onSubmit={async (e) => {
+            e.preventDefault();
+            await act('start', { goal });
+          }}
+        >
+          <input
+            aria-label="研究目标"
+            placeholder="例如：寻找 TrackMate 轨迹分析教程"
+            value={goal}
+            maxLength={200}
+            onInput={(e) => setGoal(e.target.value)}
+          />
+          <Button small disabled={busy || !goal.trim()}>
+            开始研究
+          </Button>
+        </form>
+      )}
+    </div>
+  );
+  const alerts = (
+    <>
+      <div class="error" role="alert" hidden={!error}>
+        {error}
+      </div>
+      <div class="toast" role="status" hidden={!notice}>
+        {notice}
+      </div>
+    </>
+  );
+  if (page === 'blocked')
+    return (
+      <main class="blocked-page">
+        <Logo brand={config.brand} />
+        <div class="blocked-illustration">
+          <Icon name="leaf" size={52} />
+        </div>
+        <span class="eyebrow">把注意力留给想做的事</span>
+        <h1>停一下，再决定去哪里。</h1>
+        <p class="muted">{blocked?.reason || '这个页面属于你设置的拦截范围。'}</p>
+        {blocked?.url && <p class="blocked-url">{blocked.url}</p>}
+        {session && (
+          <div class="blocked-goal">
+            <small>你正在研究</small>
+            <strong>{session.goal}</strong>
+          </div>
+        )}
+        <div class="blocked-actions">
+          <a class="button" href="index.html">
+            回到搜索 <Icon name="arrow" size={17} />
+          </a>
+          <Button
+            secondary
+            disabled={busy || !blocked}
+            onClick={() => act('pass', blockedPayload(location.hash))}
+          >
+            仅此页放行 {blocked?.minutes || config.allowMinutes} 分钟
+          </Button>
+        </div>
+        {location.hash === '#ai' && (
+          <button
+            class="text-button"
+            disabled={busy || !blocked || !session}
+            onClick={async () => {
+              if (await act('feedback', { label: 'related', remember: false, ai: true }))
+                setNotice('已纠正本次判断；当前页面仍保持拦截，可单独选择短时放行。');
+            }}
+          >
+            这页与研究相关，纠正判断
+          </button>
+        )}
+        <p class="fine">放行只适用于当前标签页的这个网址，到期恢复拦截。</p>
+        {alerts}
+        <button class="text-button" onClick={() => openSettings('blocking')}>
+          调整拦截规则
+        </button>
+        {settings && (
+          <Settings
+            config={config}
+            section={section}
+            setSection={setSection}
+            onClose={() => setSettings(false)}
+            save={saveConfig}
+            act={act}
+            state={state}
+          />
+        )}
+      </main>
+    );
+  if (page === 'popup')
+    return (
+      <main class="popup">
+        <header>
+          <Logo brand={config.brand} />
+          <button class="icon-button" aria-label="打开设置" onClick={openSettingsPage}>
+            <Icon name="settings" />
+          </button>
+        </header>
+        {task}
+        <section class="current-card">
+          <span class="eyebrow">当前页面</span>
+          <h2>{state.current?.title || '当前没有可判断的普通网页'}</h2>
+          <p class="site">{state.current?.url || '只在前台、非隐私窗口内判断'}</p>
+          <div class={`judgment ${judgment?.label || ''}`}>
+            <Icon name="shield" size={18} />
+            <span>
+              {state.checking
+                ? '正在对照研究目标…'
+                : judgment
+                ? labels[judgment.label]
+                : '等待研究任务与页面稳定停留'}
+            </span>
+          </div>
+          {judgment && (
+            <>
+              <p>{judgment.reason}</p>
+              <p class="fine">
+                {judgment.source === 'human'
+                  ? '采用你的纠正'
+                  : `模型自评 ${Math.round(judgment.confidence * 100)}% · ${
+                      judgment.input?.method === 'readability' ? '正文摘录' : '页面元数据'
+                    }`}{' '}
+                · 不是准确率
+              </p>
+            </>
+          )}
+          {state.error && <p class="error">{state.error}</p>}
+          <Button
+            secondary
+            small
+            disabled={busy || state.checking || !session}
+            onClick={() => act('check')}
+          >
+            检查当前页面
+          </Button>
+          <small class="fine block">手动检查也遵守稳定停留、最小间隔和每小时限额。</small>
+        </section>
+        <section class="feedback">
+          <span class="eyebrow">判断不合适？</span>
+          <div class="feedback-buttons">
+            {['related', 'unrelated', 'uncertain'].map((label) => (
+              <button
+                key={label}
+                disabled={busy || !session || !state.current}
+                onClick={() => act('feedback', { label, remember })}
+              >
+                {label === 'related' ? '在查资料' : label === 'unrelated' ? '确实走神' : '暂不判断'}
+              </button>
+            ))}
+          </div>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={remember}
+              onChange={(e) => setRemember(e.target.checked)}
+            />
+            以后同一目标、同一页也这样判断
+          </label>
+        </section>
+        {alerts}
+        <a class="popup-home" href="index.html" target="_blank">
+          打开专注新标签页 <Icon name="arrow" size={15} />
+        </a>
+      </main>
+    );
+  return (
+    <div class="home-shell">
+      {!isExtension && <div class="preview-banner">界面预览 · 安装扩展后启用页面判断与拦截</div>}
+      <header class="home-header">
+        <Logo brand={config.brand} />
+        <div class="header-right">
+          <span class="protection-status">
+            <span />
+            热点入口保护{config.blockFeeds ? '已开启' : '已暂停'}
+          </span>
+          <button class="settings-button" onClick={() => openSettings()}>
+            <Icon name="settings" size={18} />
+            <span>设置</span>
+          </button>
+        </div>
+      </header>
+      <main class="newtab-main">
+        <div class="hero-symbol" aria-hidden="true">
+          <Icon name="leaf" size={29} />
+        </div>
+        {config.showClock && (
+          <div class="clock-face">
+            {new Date(now).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}
+          </div>
+        )}
+        {config.title && <h1>{config.title}</h1>}
+        <form class="search-box" onSubmit={search}>
+          <Icon name="search" size={24} />
+          <input
+            ref={input}
+            type="search"
+            aria-label="搜索资料"
+            placeholder={config.placeholder}
+            autoComplete="off"
+            maxLength={240}
+            value={query}
+            onInput={(e) => setQuery(e.target.value)}
+          />
+          <button disabled={busy} aria-label="开始检索">
+            <Icon name="arrow" size={22} />
+          </button>
+        </form>
+        {config.hint && <p class="search-hint">{config.hint}</p>}
+        {config.showLinks && (
+          <nav class="shortcuts" aria-label="快捷入口">
+            {config.shortcuts.map((item) => (
+              <a key={item.id} href={item.url}>
+                <span class="shortcut-icon">{item.icon || item.name[0]}</span>
+                <span>{item.name}</span>
+              </a>
+            ))}
+            <button
+              class="shortcut-add"
+              onClick={() => openSettings('links')}
+              aria-label="管理快捷入口"
+            >
+              <Icon name="plus" size={20} />
+            </button>
+          </nav>
+        )}
+        {config.showTimer && session && (
+          <div class="session-pill">
+            <span class="session-dot" />
+            <span class="pill-goal">{session.goal}</span>
+            <Timer session={session} now={now} />
+            <button class="text-button" onClick={() => openSettings('task')}>
+              管理
+            </button>
+          </div>
+        )}
+        <div class="home-alerts">{alerts}</div>
+      </main>
+      {settings && (
+        <Settings
+          config={config}
+          section={section}
+          setSection={setSection}
+          onClose={() => {
+            setSettings(false);
+            input.current?.focus();
+          }}
+          save={saveConfig}
+          act={act}
+          state={state}
+        />
+      )}
+    </div>
+  );
+}
+
+function Settings({ config, section, setSection, onClose, save, act, state }) {
+  const dialog = useRef(),
+    [draft, setDraft] = useState(structuredClone(config)),
+    [status, setStatus] = useState(''),
+    [error, setError] = useState('');
+  const [saving, setSaving] = useState(false),
+    [goal, setGoal] = useState(state.session?.goal || ''),
+    [clear, setClear] = useState(false);
+  const importFile = useRef(),
+    closeRef = useRef();
+  const set = (key, value) => {
+    setDraft((d) => ({ ...d, [key]: value }));
+    setStatus('有未保存的修改');
+    setError('');
+  };
+  const dirty = JSON.stringify(draft) !== JSON.stringify(config);
+  const close = () => {
+    if (dirty && !confirm('还有未保存的设置。要放弃这些修改并关闭吗？')) return;
+    onClose();
+  };
+  closeRef.current = close;
+  useEffect(() => {
+    const el = dialog.current;
+    el.showModal();
+    return () => {
+      if (el.open) el.close();
+    };
+  }, []);
+  // The native dialog provides focus trapping. Read current draft in Escape
+  // handler rather than retaining the mount-time closure.
+  useEffect(() => {
+    const el = dialog.current,
+      cancel = (e) => {
+        e.preventDefault();
+        closeRef.current();
+      };
+    el.addEventListener('cancel', cancel);
+    return () => el.removeEventListener('cancel', cancel);
+  }, []);
+  async function run(type, payload = {}) {
+    setError('');
+    try {
+      return await act(type, payload, true);
+    } catch (e) {
+      setError(e.message);
+      return null;
+    }
+  }
+  async function commit(e) {
+    e?.preventDefault();
+    setSaving(true);
+    setError('');
+    try {
+      const checked = validatePatch(draft);
+      const saved = await save(checked);
+      setDraft(structuredClone(saved));
+      setStatus('已保存');
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+  async function testAI() {
+    setStatus('');
+    setError('');
+    if (dirty) {
+      setError('请先保存 AI 地址和模型，再测试连接');
+      return;
+    }
+    const result = await run('probe');
+    if (result)
+      setStatus(
+        result.available
+          ? `连接正常 · 已找到 ${config.aiModel}`
+          : `连接正常，但未安装 ${config.aiModel}。已找到：${
+              result.models.join('、') || '无可用 Qwen3 8B/14B'
+            }`
+      );
+  }
+  function downloadSettings() {
+    const blob = new Blob([JSON.stringify({ format: 'FocusTab', version: 1, config }, null, 2)], {
+      type: 'application/json',
+    });
+    const url = URL.createObjectURL(blob),
+      a = document.createElement('a');
+    a.href = url;
+    a.download = 'FocusTab-settings.json';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+  async function importSettings(event) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    try {
+      if (file.size > 200000) throw new Error('设置文件过大');
+      let parsed;
+      try {
+        parsed = JSON.parse(await file.text());
+      } catch {
+        throw new Error('设置文件不是有效的 JSON，请重新选择导出的文件');
+      }
+      if (!parsed || parsed.format !== 'FocusTab' || parsed.version !== 1)
+        throw new Error('请选择 FocusTab 导出的设置文件');
+      const checked = validatePatch(parsed.config);
+      setDraft((current) => ({ ...current, ...checked }));
+      setStatus('已载入设置，请检查后保存');
+      setError('');
+    } catch (e) {
+      setError(e.message);
+    }
+    event.target.value = '';
+  }
+  const tabs = [
+    ['appearance', '界面与文字', '01'],
+    ['links', '快捷入口', '02'],
+    ['task', '研究任务', '03'],
+    ['ai', '内容判断', '04'],
+    ['blocking', '拦截规则', '05'],
+    ['privacy', '隐私与反馈', '06'],
+  ];
+  const text = (key, label, help) => (
+    <Field label={label} help={help}>
+      <input value={draft[key]} maxLength={200} onInput={(e) => set(key, e.target.value)} />
+    </Field>
+  );
+  const numeric = (key, label, min, max, help) => (
+    <Field label={label} help={help}>
+      <input
+        type="number"
+        min={min}
+        max={max}
+        step={key === 'threshold' ? '0.01' : '1'}
+        value={draft[key]}
+        onInput={(e) => set(key, e.target.value === '' ? '' : Number(e.target.value))}
+      />
+    </Field>
+  );
+  const toggle = (key, label, help) => (
+    <Toggle value={draft[key]} label={label} help={help} onChange={(value) => set(key, value)} />
+  );
+  const select = (key, label, options, help) => (
+    <Field label={label} help={help}>
+      <select value={draft[key]} onChange={(e) => set(key, e.target.value)}>
+        {options.map(([value, name]) => (
+          <option key={value} value={value}>
+            {name}
+          </option>
+        ))}
+      </select>
+    </Field>
+  );
+  return (
+    <dialog
+      ref={dialog}
+      class="settings-dialog"
+      onClick={(e) => {
+        if (e.target === dialog.current) close();
+      }}
+      aria-labelledby="settings-title"
+    >
+      <div class="settings-shell">
+        <aside class="settings-sidebar">
+          <Logo brand={config.brand} />
+          <p class="sidebar-label">你的专注空间</p>
+          <nav aria-label="设置分组">
+            {tabs.map(([id, label, num]) => (
+              <button
+                key={id}
+                type="button"
+                class={section === id ? 'selected' : ''}
+                aria-current={section === id ? 'page' : undefined}
+                onClick={() => setSection(id)}
+              >
+                <span>{num}</span>
+                {label}
+              </button>
+            ))}
+          </nav>
+          <div class="sidebar-note">
+            <Icon name="shield" size={19} />
+            <p>
+              只做三件事
+              <br />
+              舒服地开始
+              <br />
+              理解当前页面
+              <br />
+              挡住无意的浏览
+            </p>
+          </div>
+        </aside>
+        <div class="settings-right">
+          <header class="settings-header">
+            <div>
+              <span class="eyebrow">PREFERENCES</span>
+              <h2 id="settings-title">{tabs.find((t) => t[0] === section)?.[1] || '设置'}</h2>
+            </div>
+            <button class="icon-button" aria-label="关闭设置" onClick={close}>
+              <Icon name="close" />
+            </button>
+          </header>
+          <form class="settings-form" onSubmit={commit}>
+            <div class="settings-scroll">
+              {section === 'appearance' && (
+                <>
+                  <p class="section-intro">让每一次打开，都从自己的问题开始。</p>
+                  <div class="settings-card">
+                    {text('title', '首页标题', '留空时隐藏标题。')}
+                    {text('placeholder', '搜索框提示')}
+                    {text('hint', '搜索框下方文字', '默认留空，不追加平台或计时说明。')}
+                    <div class="form-grid">
+                      {text('brand', '左上角名称')}
+                      {text('tabTitle', '浏览器标签页名称')}
+                    </div>
+                  </div>
+                  <div class="settings-card">
+                    {select('theme', '外观', [
+                      ['system', '跟随系统'],
+                      ['light', '浅色'],
+                      ['dark', '深色'],
+                    ])}
+                    {toggle('showClock', '显示时间')}
+                    {toggle('showLinks', '显示快捷入口')}
+                    {toggle('showTimer', '显示当前研究计时', '时间到点只提醒，资料页保持开放。')}
+                  </div>
+                </>
+              )}
+              {section === 'links' && (
+                <>
+                  <p class="section-intro">
+                    搜索框下方的常用入口。拖动手柄排序，也可使用上下移动按钮。
+                  </p>
+                  <ShortcutEditor
+                    items={draft.shortcuts}
+                    onChange={(value) => set('shortcuts', value)}
+                  />
+                </>
+              )}
+              {section === 'task' && (
+                <>
+                  <p class="section-intro">明确这次想查什么，AI 才有判断的依据。</p>
+                  <div class="settings-card">
+                    <Field label="这次的研究目标">
+                      <textarea
+                        rows={3}
+                        maxLength={200}
+                        placeholder="例如：学会用 TrackMate 导出轨迹 CSV"
+                        value={goal}
+                        onInput={(e) => setGoal(e.target.value)}
+                      />
+                    </Field>
+                    <div class="inline-actions">
+                      <Button
+                        type="button"
+                        small
+                        disabled={!goal.trim()}
+                        onClick={() => run('start', { goal, minutes: draft.sessionMinutes })}
+                      >
+                        开始一轮研究
+                      </Button>
+                      {state.session && (
+                        <>
+                          <Button type="button" secondary small onClick={() => run('extend')}>
+                            续时 {config.extendMinutes} 分钟
+                          </Button>
+                          <button type="button" class="text-button" onClick={() => run('end')}>
+                            结束当前任务
+                          </button>
+                        </>
+                      )}
+                    </div>
+                    {state.session && <p class="fine">当前目标：{state.session.goal}</p>}
+                  </div>
+                  <div class="settings-card">
+                    <div class="form-grid">
+                      {numeric('sessionMinutes', '默认研究时长（分钟）', 5, 120)}
+                      {numeric('extendMinutes', '每次续时（分钟）', 5, 60)}
+                    </div>
+                    {toggle(
+                      'newTaskPerSearch',
+                      '每次搜索新建研究任务',
+                      '关闭后，后续检索沿用尚未结束的目标。计时到期后搜索会新建任务。'
+                    )}
+                  </div>
+                  <div class="info-note">
+                    <strong>检索前缀</strong>
+                    <p>
+                      “B站 TrackMate”使用 Google 站内检索；“!B站 TrackMate”直接进入 B
+                      站搜索。也支持知乎、YouTube、PubMed、科研通、谷歌学术和 X。
+                    </p>
+                  </div>
+                </>
+              )}
+              {section === 'ai' && (
+                <>
+                  <p class="section-intro">对照当前目标判断资料页。信息不足时保留不确定。</p>
+                  <div class="settings-card">
+                    {toggle(
+                      'aiEnabled',
+                      '启用 AI 判断',
+                      '只在研究任务有效、页面位于前台且稳定停留后调用。'
+                    )}
+                    <Field label="NAS / Ollama 地址" help="只支持本机或局域网 IPv4 地址。">
+                      <input value={draft.aiHost} onInput={(e) => set('aiHost', e.target.value)} />
+                    </Field>
+                    {select('aiModel', '模型', [
+                      ['qwen3:8b', 'Qwen3 8B · 较省资源'],
+                      ['qwen3:14b', 'Qwen3 14B · 更大模型'],
+                    ])}
+                    <div class="preset-buttons">
+                      <span>快速配置</span>
+                      {[
+                        ['conserve', '节约 NAS'],
+                        ['balanced', '均衡'],
+                        ['careful', '更谨慎'],
+                      ].map(([id, name]) => (
+                        <button
+                          key={id}
+                          type="button"
+                          onClick={() => {
+                            setDraft((d) => ({ ...d, ...PRESETS[id] }));
+                            setStatus('已应用预设，请保存');
+                          }}
+                        >
+                          {name}
+                        </button>
+                      ))}
+                    </div>
+                    <Button type="button" secondary small onClick={testAI}>
+                      测试连接
+                    </Button>
+                  </div>
+                  <div class="settings-card">
+                    {select(
+                      'contentMode',
+                      '发送给 AI 的页面信息',
+                      [
+                        ['metadata', '仅标题与清洗后的网址'],
+                        ['summary', '标题、网址与正文摘录'],
+                      ],
+                      '摘要由 Mozilla Readability 提取，最多发送下方指定字符数。视频页不下载视频、不读取音频。'
+                    )}
+                    {numeric('excerptChars', '正文摘录上限（字符）', 300, 4000)}
+                    {select('aiAction', '明确偏离目标时', [
+                      ['remind', '提醒，保留当前页面'],
+                      ['block', '高置信度时拦截，保留短时放行入口'],
+                    ])}
+                    {numeric(
+                      'threshold',
+                      '提醒 / 拦截阈值',
+                      0.5,
+                      0.99,
+                      '模型的自评置信度，不代表实测准确率。'
+                    )}
+                    <div class="form-grid">
+                      {numeric('dwellSeconds', '稳定停留（秒）', 10, 180)}
+                      {numeric('intervalSeconds', '请求最小间隔（秒）', 30, 900)}
+                      {numeric('requestsPerHour', '每小时最多请求', 1, 60)}
+                      {numeric('cacheMinutes', '同任务页面缓存（分钟）', 1, 120)}
+                    </div>
+                    {select(
+                      'keepAlive',
+                      '模型空闲驻留',
+                      [
+                        ['30s', '30 秒'],
+                        ['1m', '1 分钟'],
+                        ['2m', '2 分钟'],
+                        ['5m', '5 分钟'],
+                      ],
+                      '较短驻留有利于 NAS 释放模型资源，但下次请求可能需要重新加载。'
+                    )}
+                  </div>
+                  <div class="settings-card">
+                    <Field
+                      label="允许判断的网站"
+                      help="每行一个域名。包含其子域名，但账户、私信等已知私密路径仍会排除。只添加你愿意发送页面信息的公开内容网站。"
+                    >
+                      <textarea
+                        rows={7}
+                        value={draft.analysisHosts.join('\n')}
+                        onInput={(e) =>
+                          set(
+                            'analysisHosts',
+                            e.target.value
+                              .split('\n')
+                              .map((s) => s.trim().toLowerCase())
+                              .filter(Boolean)
+                          )
+                        }
+                      />
+                    </Field>
+                  </div>
+                  <p class="fine">
+                    AI 连接失败或输出格式无效时，资料页保持开放，网址拦截继续工作。Ollama 若返回
+                    403，请在 NAS 仅允许此扩展来源：
+                    <code>{state.extensionOrigin || '安装后显示扩展来源'}</code>。
+                  </p>
+                </>
+              )}
+              {section === 'blocking' && (
+                <>
+                  <p class="section-intro">挡住推荐入口，留下搜索、具体资料和文献功能。</p>
+                  <div class="settings-card">
+                    {toggle(
+                      'blockFeeds',
+                      '全天拦截热点与推荐入口',
+                      '无需 ActivityWatch、本地服务或另装 LeechBlock。'
+                    )}
+                    {BUILTINS.map((r) => (
+                      <Toggle
+                        key={r.id}
+                        label={r.name}
+                        help={r.paths ? r.paths.join(' · ') : r.host}
+                        value={!(draft.disabledRules || []).includes(r.id)}
+                        onChange={(enabled) =>
+                          set(
+                            'disabledRules',
+                            enabled
+                              ? (draft.disabledRules || []).filter((id) => id !== r.id)
+                              : [...(draft.disabledRules || []), r.id]
+                          )
+                        }
+                      />
+                    ))}
+                  </div>
+                  <div class="settings-card">
+                    {numeric(
+                      'allowMinutes',
+                      '被拦截页面临时放行（分钟）',
+                      1,
+                      30,
+                      '只放行当前标签页的精确网址。到期恢复拦截，其他页面仍受原规则保护。'
+                    )}
+                    <h3>自定义网址规则</h3>
+                    <RuleEditor
+                      items={draft.customRules}
+                      onChange={(value) => set('customRules', value)}
+                    />
+                  </div>
+                  <div class="info-note">
+                    <strong>科研通的特殊处理</strong>
+                    <p>默认只拦截 /tophot 及其下级页面。首页、检索和文献互助等其他功能保持开放。</p>
+                  </div>
+                </>
+              )}
+              {section === 'privacy' && (
+                <>
+                  <p class="section-intro">不统计桌面软件，不读取浏览历史，不截图。</p>
+                  <div class="settings-card">
+                    <h3>AI 能看到什么</h3>
+                    <p>
+                      本次研究目标、当前页面标题、清洗后的网址；开启正文模式时，还包括有长度上限的正文摘录。只发送至你设置的
+                      NAS 地址，不发送整段浏览历史。
+                    </p>
+                    <p>
+                      页面正文可能仍含个人信息。提取器会移除表单和可编辑内容并遮盖邮箱；只对你选择的网站启用，私密站点请勿加入。
+                    </p>
+                    {numeric('idleSeconds', '无操作多久暂停检测（秒）', 60, 3600)}
+                    <p class="fine">
+                      当前默认 5 分钟无鼠标键盘操作会暂停
+                      AI。阅读长文章时可以调长；这里只决定检测，不记录用时。
+                    </p>
+                  </div>
+                  <div class="settings-card">
+                    <h3>纠错与反馈</h3>
+                    <p>
+                      工具栏弹窗可标记“在查资料”“确实走神”“暂不判断”。纠正仅匹配同一目标、同一页面标题与网址。选择“以后也这样判断”才跨研究轮次复用。
+                    </p>
+                    <p class="fine">
+                      这是本地纠正规则，不会训练或修改 NAS 模型。最多保存 200 条，支持撤销和清除。
+                    </p>
+                    {numeric('retentionDays', '反馈保留（天）', 1, 365)}
+                    <div class="inline-actions">
+                      <Button
+                        type="button"
+                        secondary
+                        small
+                        disabled={!state.feedback?.length}
+                        onClick={() => run('undo')}
+                      >
+                        撤销最近反馈
+                      </Button>
+                      <button
+                        type="button"
+                        class="text-button danger"
+                        onClick={async () => {
+                          if (clear) {
+                            const result = await run('clear');
+                            if (result) {
+                              setClear(false);
+                              setStatus('反馈已清除');
+                            }
+                          } else setClear(true);
+                        }}
+                      >
+                        {clear ? '确认清除所有反馈' : '清除全部反馈'}
+                      </button>
+                      <small>{state.feedback?.length || 0} 条有效反馈</small>
+                    </div>
+                  </div>
+                  <div class="settings-card">
+                    <h3>备份与迁移</h3>
+                    <p class="fine">仅导出界面、AI 和拦截设置，不含研究目标、正文和反馈。</p>
+                    <div class="inline-actions">
+                      <Button type="button" secondary small onClick={downloadSettings}>
+                        导出设置
+                      </Button>
+                      <Button
+                        type="button"
+                        secondary
+                        small
+                        onClick={() => importFile.current.click()}
+                      >
+                        导入设置
+                      </Button>
+                      <input
+                        ref={importFile}
+                        type="file"
+                        accept="application/json,.json"
+                        hidden
+                        onChange={importSettings}
+                      />
+                    </div>
+                  </div>
+                  <p class="fine">
+                    开源基础：Preact、SortableJS、Mozilla Readability、Ollama JS 与 LeechBlock
+                    网址匹配代码。
+                    <a href="https://github.com/poesein/FocusTab" target="_blank" rel="noreferrer">
+                      查看源码与许可证
+                    </a>
+                  </p>
+                </>
+              )}
+            </div>
+            <footer class="settings-footer">
+              <div aria-live={error ? 'assertive' : 'polite'} role={error ? 'alert' : 'status'}>
+                <span class={error ? 'error-text' : dirty ? 'muted' : 'saved'}>
+                  {error || status || '设置保存在当前浏览器'}
+                </span>
+              </div>
+              <Button disabled={saving || !dirty} icon={dirty ? undefined : 'check'}>
+                {saving ? '正在保存…' : dirty ? '保存设置' : '已保存'}
+              </Button>
+            </footer>
+          </form>
+        </div>
+      </div>
+    </dialog>
+  );
+}
+
+function ShortcutEditor({ items, onChange }) {
+  const list = useRef();
+  useEffect(() => {
+    const sortable = Sortable.create(list.current, {
+      handle: '.drag-handle',
+      animation: 140,
+      onEnd: (event) => {
+        const { oldIndex, newIndex, item, from } = event;
+        if (oldIndex === newIndex) return;
+        // Restore DOM before Preact reconciles the new ordering.
+        from.removeChild(item);
+        from.insertBefore(item, from.children[oldIndex] || null);
+        const next = [...items],
+          [moved] = next.splice(oldIndex, 1);
+        next.splice(newIndex, 0, moved);
+        onChange(next);
+      },
+    });
+    return () => sortable.destroy();
+  }, [items]);
+  const update = (i, key, value) =>
+    onChange(items.map((item, n) => (n === i ? { ...item, [key]: value } : item)));
+  const move = (i, shift) => {
+    const next = [...items];
+    [next[i], next[i + shift]] = [next[i + shift], next[i]];
+    onChange(next);
+  };
+  return (
+    <div class="settings-card">
+      <div ref={list} class="shortcut-editor">
+        {items.map((item, i) => (
+          <div class="shortcut-row" key={item.id}>
+            <span class="drag-handle" aria-hidden="true">
+              ⠿
+            </span>
+            <input
+              class="icon-input"
+              aria-label={`入口 ${i + 1} 图标`}
+              value={item.icon}
+              maxLength={8}
+              onInput={(e) => update(i, 'icon', e.target.value)}
+            />
+            <div class="shortcut-fields">
+              <input
+                aria-label={`入口 ${i + 1} 名称`}
+                placeholder="名称"
+                value={item.name}
+                maxLength={30}
+                onInput={(e) => update(i, 'name', e.target.value)}
+              />
+              <input
+                aria-label={`入口 ${i + 1} 网址`}
+                type="url"
+                placeholder="https://"
+                value={item.url}
+                onInput={(e) => update(i, 'url', e.target.value)}
+              />
+            </div>
+            <div class="row-actions">
+              <button
+                type="button"
+                aria-label={`上移 ${item.name}`}
+                disabled={i === 0}
+                onClick={() => move(i, -1)}
+              >
+                ↑
+              </button>
+              <button
+                type="button"
+                aria-label={`下移 ${item.name}`}
+                disabled={i === items.length - 1}
+                onClick={() => move(i, 1)}
+              >
+                ↓
+              </button>
+              <button
+                type="button"
+                class="danger"
+                aria-label={`删除 ${item.name}`}
+                onClick={() => onChange(items.filter((_, n) => n !== i))}
+              >
+                ×
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+      <Button
+        type="button"
+        secondary
+        small
+        icon="plus"
+        disabled={items.length >= 20}
+        onClick={() =>
+          onChange([
+            ...items,
+            { id: crypto.randomUUID(), name: '新入口', url: 'https://example.com/', icon: '链' },
+          ])
+        }
+      >
+        添加快捷入口
+      </Button>
+    </div>
+  );
+}
+function RuleEditor({ items, onChange }) {
+  const update = (i, patch) =>
+    onChange(items.map((item, n) => (n === i ? { ...item, ...patch } : item)));
+  return (
+    <div class="rule-editor">
+      {!items.length && <p class="fine">暂无自定义规则。可以只拦一个路径，或选择整个网站。</p>}
+      {items.map((item, i) => (
+        <div class="custom-rule" key={item.id}>
+          <div class="form-grid">
+            <Field label="域名">
+              <input
+                aria-label={`规则 ${i + 1} 域名`}
+                placeholder="example.com"
+                value={item.host}
+                onInput={(e) => update(i, { host: e.target.value.trim().toLowerCase() })}
+              />
+            </Field>
+            <Field label="路径">
+              <input
+                aria-label={`规则 ${i + 1} 路径`}
+                value={item.path}
+                disabled={item.allPaths}
+                onInput={(e) => update(i, { path: e.target.value })}
+              />
+            </Field>
+          </div>
+          <div class="rule-actions">
+            <label class="checkbox">
+              <input
+                type="checkbox"
+                checked={item.allPaths}
+                onChange={(e) => update(i, { allPaths: e.target.checked })}
+              />
+              拦截整个网站与子域名
+            </label>
+            <button
+              type="button"
+              class="text-button danger"
+              onClick={() => onChange(items.filter((_, n) => n !== i))}
+            >
+              删除
+            </button>
+          </div>
+        </div>
+      ))}
+      <Button
+        type="button"
+        secondary
+        small
+        icon="plus"
+        disabled={items.length >= 50}
+        onClick={() =>
+          onChange([...items, { id: crypto.randomUUID(), host: '', path: '/', allPaths: false }])
+        }
+      >
+        添加网址规则
+      </Button>
+    </div>
+  );
+}
+
+render(<App />, $('#app'));

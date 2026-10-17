@@ -1,0 +1,658 @@
+import { loadConfig, validatePatch } from './config.mjs';
+import {
+  blockedBy,
+  canAnalyze,
+  cleanURL,
+  documentKey,
+  feedbackLookup,
+  httpURL,
+  makeDNR,
+} from './rules.mjs';
+import { classify, probe } from './ai.mjs';
+import { resolveSearch } from './search.mjs';
+
+export class FocusEngine {
+  constructor(api, enqueue, now = () => Date.now(), ai = classify) {
+    this.api = api;
+    this.enqueue = enqueue;
+    this.now = now;
+    this.ai = ai;
+    this.runtime = {
+      active: null,
+      calls: [],
+      lastAI: 0,
+      judgment: null,
+      cache: [],
+      error: '',
+      notice: '',
+    };
+    this.session = null;
+    this.feedback = [];
+    this.config = loadConfig();
+    this.pending = null;
+  }
+  async init() {
+    const [local, volatile] = await Promise.all([
+      this.api.storage.local.get(['focusConfig', 'focusSession', 'focusFeedback']),
+      this.api.storage.session.get('focusRuntime'),
+    ]);
+    this.config = loadConfig(local.focusConfig);
+    this.session = local.focusSession || null;
+    this.feedback = (local.focusFeedback || [])
+      .filter((r) => r.created > this.now() - this.config.retentionDays * 864e5)
+      .slice(-200);
+    Object.assign(this.runtime, volatile.focusRuntime || {});
+    this.runtime.calls = Array.isArray(this.runtime.calls)
+      ? this.runtime.calls.filter(
+          (t) => Number.isFinite(t) && t > this.now() - 36e5 && t <= this.now()
+        )
+      : [];
+    this.runtime.cache = Array.isArray(this.runtime.cache) ? this.runtime.cache.slice(0, 50) : [];
+    if (
+      !this.session ||
+      typeof this.session.id !== 'string' ||
+      typeof this.session.goal !== 'string' ||
+      !Number.isFinite(this.session.ends)
+    )
+      this.session = null;
+    this.api.idle.setDetectionInterval(this.config.idleSeconds);
+    await this.syncRules();
+    // Session DNR rules survive worker suspension. Reconcile them against their
+    // leases after every wake so an interrupted write cannot leave an allow.
+    const { focusPasses = [] } = await this.api.storage.session.get('focusPasses');
+    const liveIds = new Set(focusPasses.filter((p) => p.until > this.now()).map((p) => p.ruleId));
+    const oldSessionRules = await this.api.declarativeNetRequest.getSessionRules();
+    await this.api.declarativeNetRequest.updateSessionRules({
+      removeRuleIds: oldSessionRules.filter((r) => !liveIds.has(r.id)).map((r) => r.id),
+    });
+    await this.api.alarms.create('focus-check', { periodInMinutes: 0.5 });
+    await this.reconcile();
+  }
+  async saveRuntime() {
+    await this.api.storage.session.set({ focusRuntime: this.runtime });
+  }
+  async syncRules() {
+    const rules = makeDNR(this.config, this.api.runtime.getURL(''));
+    for (const r of rules) {
+      const supported = await this.api.declarativeNetRequest.isRegexSupported({
+        regex: r.condition.regexFilter,
+        isCaseSensitive: false,
+      });
+      if (!supported.isSupported) throw new Error('浏览器不支持此网址规则，请缩短路径');
+    }
+    const previous = await this.api.declarativeNetRequest.getDynamicRules();
+    await this.api.declarativeNetRequest.updateDynamicRules({
+      removeRuleIds: previous.map((r) => r.id),
+      addRules: rules,
+    });
+  }
+  cancelPending() {
+    this.pending?.controller.abort();
+    this.pending = null;
+  }
+  async tabRemoved(tabId) {
+    const { focusPasses = [] } = await this.api.storage.session.get('focusPasses');
+    const removed = focusPasses.filter((p) => p.tabId === tabId);
+    if (removed.length) {
+      await this.api.declarativeNetRequest.updateSessionRules({
+        removeRuleIds: removed.map((p) => p.ruleId),
+      });
+      await this.api.storage.session.set({
+        focusPasses: focusPasses.filter((p) => p.tabId !== tabId),
+      });
+    }
+    await this.api.storage.session.remove('aiBlock:' + tabId);
+    await this.reconcile();
+  }
+  async aiBlock(tabId, raw) {
+    if (!this.session || !this.config.aiEnabled || this.config.aiAction !== 'block') return null;
+    const key = 'aiBlock:' + tabId;
+    const row = (await this.api.storage.session.get(key))[key];
+    if (
+      !row ||
+      row.url !== raw ||
+      row.sessionId !== this.session?.id ||
+      this.session.ends <= this.now()
+    )
+      return null;
+    const correction = feedbackLookup(
+      this.feedback,
+      row.key,
+      this.session.id,
+      this.config,
+      this.now()
+    );
+    return correction?.label === 'related' ? null : row;
+  }
+  async maintenance() {
+    await this.expirePasses();
+    const now = this.now();
+    if (this.session?.ends <= now && !this.session.notified) {
+      this.cancelPending();
+      this.runtime.judgment = null;
+      this.session.notified = true;
+      await this.api.storage.local.set({ focusSession: this.session });
+      this.runtime.notice = '这次研究时间到了。可以继续研究、续时，或结束任务，资料页会保留。';
+      await this.notify('研究计时结束', this.runtime.notice);
+    }
+    const { focusPasses = [] } = await this.api.storage.session.get('focusPasses');
+    const deadlines = focusPasses.map((p) => p.until).filter((t) => t > now);
+    if (this.session?.ends > now) deadlines.push(this.session.ends);
+    if (deadlines.length)
+      await this.api.alarms.create('focus-expiry', { when: Math.min(...deadlines) });
+    else await this.api.alarms.clear('focus-expiry');
+  }
+  async foreground() {
+    const win = await this.api.windows.getLastFocused();
+    if (!win?.focused || win.incognito) return null;
+    const idle = await this.api.idle.queryState(this.config.idleSeconds);
+    if (idle !== 'active') return null;
+    const [tab] = await this.api.tabs.query({ active: true, windowId: win.id });
+    if (!tab || tab.incognito || !httpURL(tab.url)) return null;
+    return tab;
+  }
+  async reconcile() {
+    const now = this.now();
+    // Expiry enforcement must also run when Chrome is unfocused, idle, or the
+    // foreground is an extension/new-tab page.
+    await this.maintenance();
+    let tab;
+    try {
+      tab = await this.foreground();
+    } catch {
+      tab = null;
+    }
+    const old = this.runtime.active;
+    if (!tab) {
+      this.cancelPending();
+      this.runtime.active = null;
+      this.runtime.judgment = null;
+      await this.api.action.setBadgeText({ text: '' });
+      await this.saveRuntime();
+      return;
+    }
+    // Exact-page passes are session rules, never whole-site exceptions.
+    const pass = await this.currentPass(tab.id, tab.url);
+    const block = blockedBy(tab.url, this.config);
+    const aiBlock = await this.aiBlock(tab.id, tab.url);
+    if ((block || aiBlock) && !pass) {
+      this.cancelPending();
+      this.runtime.active = null;
+      this.runtime.judgment = null;
+      await this.api.tabs.update(tab.id, {
+        url:
+          this.api.runtime.getURL('blocked.html') +
+          (aiBlock ? '#ai' : '#url=' + encodeURIComponent(tab.url)),
+      });
+      await this.saveRuntime();
+      return;
+    }
+    const identity = JSON.stringify([tab.id, tab.url, tab.title || '']);
+    if (old?.identity !== identity) {
+      this.cancelPending();
+      this.runtime.judgment = null;
+      this.runtime.error = '';
+      this.runtime.active = {
+        identity,
+        tabId: tab.id,
+        url: tab.url,
+        title: (tab.title || '').slice(0, 300),
+        since: now,
+      };
+      await this.api.action.setBadgeText({ text: '' });
+    }
+    this.maybeAI();
+    await this.saveRuntime();
+  }
+  async currentPass(tabId, raw) {
+    const { focusPasses = [] } = await this.api.storage.session.get('focusPasses');
+    return focusPasses.some((p) => p.tabId === tabId && p.url === raw && p.until > this.now());
+  }
+  async expirePasses() {
+    const { focusPasses = [] } = await this.api.storage.session.get('focusPasses');
+    const keep = [];
+    for (const pass of focusPasses) {
+      if (pass.until > this.now()) {
+        keep.push(pass);
+        continue;
+      }
+      await this.api.declarativeNetRequest.updateSessionRules({ removeRuleIds: [pass.ruleId] });
+      try {
+        const tab = await this.api.tabs.get(pass.tabId);
+        if (tab.url === pass.url) {
+          const aiBlock = await this.aiBlock(tab.id, tab.url);
+          if (blockedBy(tab.url, this.config) || aiBlock)
+            await this.api.tabs.update(tab.id, {
+              url:
+                this.api.runtime.getURL('blocked.html') +
+                (aiBlock ? '#ai' : '#url=' + encodeURIComponent(tab.url)),
+            });
+        }
+      } catch {
+        /* closed tab */
+      }
+    }
+    if (keep.length !== focusPasses.length)
+      await this.api.storage.session.set({ focusPasses: keep });
+  }
+  maybeAI(force = false) {
+    const now = this.now(),
+      active = this.runtime.active,
+      session = this.session;
+    this.runtime.calls = this.runtime.calls.filter((t) => now - t < 36e5);
+    if (
+      !active ||
+      !session ||
+      session.ends <= now ||
+      !this.config.aiEnabled ||
+      !canAnalyze(active.url, this.config)
+    )
+      return;
+    if (now - active.since < this.config.dwellSeconds * 1000 || this.pending) return;
+    const key = documentKey(session.goal, active.url, active.title);
+    const correction = feedbackLookup(this.feedback, key, session.id, this.config, now);
+    if (correction) {
+      this.runtime.judgment = {
+        label: correction.label,
+        confidence: 1,
+        reason: '采用你对此任务和此页面的纠正',
+        source: 'human',
+        key,
+        created: now,
+      };
+      return;
+    }
+    const cached = this.runtime.cache.find(
+      (r) => r.key === key && now - r.created < this.config.cacheMinutes * 6e4
+    );
+    if (cached && !force) {
+      this.runtime.judgment = cached;
+      return;
+    }
+    // Manual checks also respect NAS budget; no unbounded button bypass.
+    if (
+      now - this.runtime.lastAI < this.config.intervalSeconds * 1000 ||
+      this.runtime.calls.length >= this.config.requestsPerHour
+    )
+      return;
+    this.runtime.lastAI = now;
+    this.runtime.calls.push(now);
+    this.runtime.error = '';
+    const controller = new AbortController(),
+      pending = { controller, identity: active.identity, key, sessionId: session.id };
+    this.pending = pending;
+    const config = structuredClone(this.config);
+    const timeout = setTimeout(() => controller.abort(), 25000);
+    this.readAndClassify(config, session.goal, active, controller.signal)
+      .then((result) =>
+        this.enqueue(async () => {
+          if (!(await this.isCurrent(pending))) return;
+          this.runtime.judgment = { ...result, key, created: this.now() };
+          this.runtime.cache = [
+            this.runtime.judgment,
+            ...this.runtime.cache.filter((r) => r.key !== key),
+          ].slice(0, 50);
+          await this.api.action.setBadgeBackgroundColor({
+            color: result.label === 'unrelated' ? '#b76725' : '#386e59',
+          });
+          await this.api.action.setBadgeText({
+            text: { related: '研', unrelated: '偏', uncertain: '?' }[result.label],
+          });
+          if (result.label === 'unrelated' && result.confidence >= config.threshold) {
+            await this.notify('这一页可能偏离了研究目标', result.reason);
+            if (
+              config.aiAction === 'block' &&
+              !(await this.currentPass(active.tabId, active.url))
+            ) {
+              await this.api.storage.session.set({
+                ['aiBlock:' + active.tabId]: {
+                  url: active.url,
+                  title: active.title,
+                  reason: result.reason,
+                  key,
+                  sessionId: session.id,
+                },
+              });
+              await this.api.tabs.update(active.tabId, {
+                url: this.api.runtime.getURL('blocked.html') + '#ai',
+              });
+            }
+          }
+          await this.saveRuntime();
+        })
+      )
+      .catch((error) =>
+        this.enqueue(async () => {
+          if (!(await this.isCurrent(pending))) return;
+          this.runtime.error =
+            error.name === 'AbortError'
+              ? 'AI 请求已超时；资料页保持开放，网址规则继续生效。'
+              : 'AI 暂不可用：' + String(error.message || error).slice(0, 160);
+          this.runtime.judgment = null;
+          await this.saveRuntime();
+        })
+      )
+      .finally(() => {
+        clearTimeout(timeout);
+        if (this.pending === pending) this.pending = null;
+      });
+  }
+  async isCurrent(pending) {
+    if (
+      this.pending !== pending ||
+      this.session?.id !== pending.sessionId ||
+      this.session.ends <= this.now()
+    )
+      return false;
+    let tab;
+    try {
+      tab = await this.foreground();
+    } catch {
+      return false;
+    }
+    return !!tab && JSON.stringify([tab.id, tab.url, tab.title || '']) === pending.identity;
+  }
+  async readAndClassify(config, goal, active, signal) {
+    let page = { url: active.url, title: active.title, excerpt: '', method: 'metadata' };
+    if (config.contentMode === 'summary') {
+      try {
+        await this.api.scripting.executeScript({
+          target: { tabId: active.tabId },
+          files: ['extractor.js'],
+        });
+        const [row] = await this.api.scripting.executeScript({
+          target: { tabId: active.tabId },
+          func: (max) => globalThis.__focusTabExtract(max),
+          args: [config.excerptChars],
+        });
+        if (row?.result?.url !== active.url) throw new Error('页面已切换');
+        page = row.result;
+      } catch (error) {
+        if (error.message === '页面已切换') throw error;
+        // Restricted pages/injection errors don't imply unrelated content.
+      }
+    }
+    if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+    const result = await this.ai(config, goal, page, signal);
+    return {
+      ...result,
+      input: {
+        title: page.title,
+        url: cleanURL(page.url),
+        method: page.method,
+        excerptLength: page.excerpt?.length || 0,
+      },
+    };
+  }
+  async notify(title, message) {
+    try {
+      await this.api.notifications.create('focus-notice', {
+        type: 'basic',
+        iconUrl: 'icons/icon-128.png',
+        title,
+        message,
+      });
+    } catch {
+      /* A denied OS notification must not interrupt enforcement. */
+    }
+  }
+  async snapshot() {
+    const active = this.runtime.active;
+    return {
+      config: this.config,
+      session: this.session,
+      current: active ? { url: cleanURL(active.url), title: active.title } : null,
+      judgment: this.runtime.judgment,
+      error: this.runtime.error,
+      notice: this.runtime.notice,
+      calls: this.runtime.calls.length,
+      feedback: this.feedback
+        .filter((r) => r.active)
+        .map(({ id, label, created, remember }) => ({ id, label, created, remember })),
+      extensionOrigin: this.api.runtime.getURL('').replace(/\/$/, ''),
+      checking: !!this.pending,
+    };
+  }
+  async dispatch(message, sender) {
+    if (
+      !message ||
+      typeof message.type !== 'string' ||
+      !message.type.startsWith('focus:') ||
+      (message.payload !== undefined &&
+        (!message.payload || typeof message.payload !== 'object' || Array.isArray(message.payload)))
+    )
+      throw new Error('消息格式无效');
+    if (JSON.stringify(message).length > 40000) throw new Error('消息过长');
+    const { type, payload = {} } = message;
+    if (type === 'focus:state') return this.snapshot();
+    if (type === 'focus:config') {
+      const patch = validatePatch(payload);
+      const before = this.config;
+      this.config = { ...before, ...patch };
+      try {
+        await this.syncRules();
+        await this.api.storage.local.set({ focusConfig: this.config });
+      } catch (error) {
+        this.config = before;
+        await this.syncRules();
+        throw error;
+      }
+      this.cancelPending();
+      this.runtime.cache = [];
+      this.runtime.judgment = null;
+      this.api.idle.setDetectionInterval(this.config.idleSeconds);
+      await this.reconcile();
+      return this.snapshot();
+    }
+    if (type === 'focus:start' || type === 'focus:search') {
+      if (type === 'focus:start' && typeof payload.goal !== 'string')
+        throw new Error('请填写 1–200 字研究目标');
+      let goal = String(payload.goal || '').trim(),
+        target;
+      if (type === 'focus:search') {
+        target = resolveSearch(payload.query || '');
+        goal = target.goal;
+      }
+      if (!goal || goal.length > 200) throw new Error('请填写 1–200 字研究目标');
+      const minutes = payload.minutes ?? this.config.sessionMinutes;
+      validatePatch({ sessionMinutes: minutes });
+      if (
+        type === 'focus:start' ||
+        this.config.newTaskPerSearch ||
+        !this.session ||
+        this.session.ends <= this.now()
+      ) {
+        this.cancelPending();
+        this.runtime.cache = [];
+        this.runtime.judgment = null;
+        this.runtime.notice = '';
+        this.session = {
+          id: crypto.randomUUID(),
+          goal,
+          started: this.now(),
+          ends: this.now() + minutes * 6e4,
+          notified: false,
+        };
+        await this.api.storage.local.set({ focusSession: this.session });
+      }
+      await this.saveRuntime();
+      await this.maintenance();
+      return target ? { url: target.url } : this.snapshot();
+    }
+    if (type === 'focus:end') {
+      this.cancelPending();
+      this.session = null;
+      this.runtime.judgment = null;
+      this.runtime.notice = '';
+      await this.api.storage.local.remove('focusSession');
+      await this.maintenance();
+      await this.saveRuntime();
+      return this.snapshot();
+    }
+    if (type === 'focus:extend') {
+      if (!this.session) throw new Error('请先开始一次研究');
+      this.session.ends = Math.max(this.now(), this.session.ends) + this.config.extendMinutes * 6e4;
+      this.session.notified = false;
+      this.runtime.notice = '';
+      await this.api.storage.local.set({ focusSession: this.session });
+      await this.maintenance();
+      return this.snapshot();
+    }
+    if (type === 'focus:probe') return probe(this.config);
+    if (type === 'focus:check') {
+      await this.reconcile();
+      this.maybeAI(true);
+      await this.saveRuntime();
+      return this.snapshot();
+    }
+    if (type === 'focus:feedback') {
+      let a = this.runtime.active;
+      const s = this.session;
+      if (payload.ai && Number.isInteger(sender.tab?.id)) {
+        const key = 'aiBlock:' + sender.tab.id;
+        const row = (await this.api.storage.session.get(key))[key];
+        if (row?.sessionId === s?.id) a = { ...row, tabId: sender.tab.id };
+      } else if (a) {
+        const tab = await this.foreground();
+        if (!tab || JSON.stringify([tab.id, tab.url, tab.title || '']) !== a.identity) a = null;
+      }
+      if (!a || !s || s.ends <= this.now() || !canAnalyze(a.url, this.config))
+        throw new Error('当前没有可纠正的研究页面');
+      if (
+        !['related', 'unrelated', 'uncertain'].includes(payload.label) ||
+        typeof payload.remember !== 'boolean'
+      )
+        throw new Error('反馈格式无效');
+      const key = documentKey(s.goal, a.url, a.title);
+      this.cancelPending();
+      this.runtime.cache = this.runtime.cache.filter((r) => r.key !== key);
+      this.feedback.push({
+        id: crypto.randomUUID(),
+        key,
+        label: payload.label,
+        remember: payload.remember,
+        sessionId: s.id,
+        created: this.now(),
+        active: true,
+      });
+      this.feedback = this.feedback
+        .filter((r) => r.created > this.now() - this.config.retentionDays * 864e5)
+        .slice(-200);
+      await this.api.storage.local.set({ focusFeedback: this.feedback });
+      this.runtime.judgment = {
+        label: payload.label,
+        confidence: 1,
+        reason: '采用你对此任务和此页面的纠正',
+        source: 'human',
+        key,
+        created: this.now(),
+      };
+      if (
+        payload.label === 'unrelated' &&
+        this.config.aiEnabled &&
+        this.config.aiAction === 'block' &&
+        !(await this.currentPass(a.tabId, a.url))
+      ) {
+        await this.api.storage.session.set({
+          ['aiBlock:' + a.tabId]: {
+            url: a.url,
+            title: a.title,
+            reason: '你已将此页面标记为与当前研究无关',
+            key,
+            sessionId: s.id,
+            source: 'human',
+          },
+        });
+        await this.api.tabs.update(a.tabId, {
+          url: this.api.runtime.getURL('blocked.html') + '#ai',
+        });
+      }
+      await this.saveRuntime();
+      return this.snapshot();
+    }
+    if (type === 'focus:undo') {
+      const row = [...this.feedback].reverse().find((r) => r.active);
+      if (row) row.active = false;
+      this.runtime.cache = [];
+      this.runtime.judgment = null;
+      await this.api.storage.local.set({ focusFeedback: this.feedback });
+      await this.saveRuntime();
+      return this.snapshot();
+    }
+    if (type === 'focus:clear') {
+      this.cancelPending();
+      this.feedback = [];
+      this.runtime.cache = [];
+      this.runtime.judgment = null;
+      await this.api.storage.local.remove('focusFeedback');
+      await this.saveRuntime();
+      return this.snapshot();
+    }
+    if (type === 'focus:blocked' || type === 'focus:pass') {
+      const tabId = sender.tab?.id;
+      if (!Number.isInteger(tabId)) throw new Error('请在被拦截的标签页执行');
+      let original = httpURL(payload.url)?.href;
+      const stored = (await this.api.storage.session.get('aiBlock:' + tabId))['aiBlock:' + tabId];
+      if (payload.ai) original = stored?.url;
+      if (
+        !original ||
+        (payload.ai
+          ? !stored || stored.sessionId !== this.session?.id
+          : !blockedBy(original, this.config))
+      )
+        throw new Error('没有可放行的页面');
+      if (type === 'focus:blocked')
+        return {
+          url: cleanURL(original),
+          title: payload.ai ? stored.title : '',
+          reason: payload.ai ? stored.reason : blockedBy(original, this.config)?.name,
+          ai: !!payload.ai,
+          source: payload.ai ? stored.source || 'ai' : 'rule',
+          minutes: this.config.allowMinutes,
+        };
+      const { focusPasses = [] } = await this.api.storage.session.get('focusPasses');
+      const ruleId = 100000 + tabId;
+      // URL fragments never reach the network; matching them in a DNR regex
+      // would make a seemingly granted pass fail on its first navigation.
+      const networkURL = new URL(original);
+      networkURL.hash = '';
+      const exact = '^' + networkURL.href.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$';
+      const supported = await this.api.declarativeNetRequest.isRegexSupported({
+        regex: exact,
+        isCaseSensitive: true,
+      });
+      if (!supported.isSupported) throw new Error('网址太长，无法精确放行；请从检索页查找资料');
+      await this.api.declarativeNetRequest.updateSessionRules({
+        removeRuleIds: [ruleId],
+        addRules: [
+          {
+            id: ruleId,
+            priority: 10,
+            action: { type: 'allow' },
+            condition: {
+              tabIds: [tabId],
+              regexFilter: exact,
+              isUrlFilterCaseSensitive: true,
+              resourceTypes: ['main_frame'],
+            },
+          },
+        ],
+      });
+      try {
+        await this.api.storage.session.set({
+          focusPasses: [
+            ...focusPasses.filter((p) => p.tabId !== tabId),
+            { tabId, ruleId, url: original, until: this.now() + this.config.allowMinutes * 6e4 },
+          ],
+        });
+      } catch (error) {
+        await this.api.declarativeNetRequest.updateSessionRules({ removeRuleIds: [ruleId] });
+        throw error;
+      }
+      await this.maintenance();
+      await this.api.tabs.update(tabId, { url: original });
+      return { ok: true };
+    }
+    throw new Error('不支持的操作');
+  }
+}
