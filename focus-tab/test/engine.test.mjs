@@ -290,6 +290,7 @@ test('AI-blocked exact-page pass expires, then human correction can release that
 
 test('feedback rejects stale foreground and expired tasks, blocks no other URL or session', async () => {
   const f = await fixture();
+  f.engine.config.autoClassify = false;
   await f.start();
   f.state.tabs.get(1).url = 'https://www.bilibili.com/video/different';
   await assert.rejects(

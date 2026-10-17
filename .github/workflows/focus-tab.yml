@@ -17,18 +17,47 @@ jobs:
       run:
         working-directory: focus-tab
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: '22'
           cache: npm
           cache-dependency-path: focus-tab/package-lock.json
-      - run: npm ci --no-audit --no-fund
+      - name: Show tool versions
+        run: |
+          node --version
+          npm --version
+      - name: Validate cross-platform lock metadata
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFile } from 'node:fs/promises';
+          const { packages } = JSON.parse(await readFile('package-lock.json', 'utf8'));
+          const invalid = Object.entries(packages).filter(([name, value]) => name && !value.link && !value.version).map(([name]) => name);
+          const esbuild = packages['node_modules/esbuild'];
+          for (const [name, version] of Object.entries(esbuild.optionalDependencies)) {
+            const value = packages['node_modules/' + name] || packages['node_modules/esbuild/node_modules/' + name];
+            if (!value || value.version !== version || !value.resolved || !value.integrity) invalid.push(name);
+          }
+          if (invalid.length) throw new Error('Incomplete package-lock metadata: ' + invalid.join(', '));
+          console.log('All dependency versions and esbuild platform packages are locked.');
+          NODE
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund --logs-dir "${{ runner.temp }}/focus-tab-npm-logs"
       - run: npm test
       - run: npm run build
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: FocusTab-extension
           path: focus-tab/dist/
           if-no-files-found: error
           retention-days: 14
+      - name: Upload npm failure logs
+        if: failure()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: FocusTab-npm-failure-logs
+          path: ${{ runner.temp }}/focus-tab-npm-logs/
+          if-no-files-found: ignore
+          retention-days: 7

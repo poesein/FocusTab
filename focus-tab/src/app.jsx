@@ -137,8 +137,11 @@ function App() {
   const [state, setState] = useState(null),
     [error, setError] = useState(''),
     [notice, setNotice] = useState('');
-  const [settings, setSettings] = useState(location.hash === '#settings'),
-    [section, setSection] = useState('appearance');
+  const initialSettings = location.hash.match(
+    /^#settings(?:\/(appearance|links|task|ai|blocking|privacy))?$/
+  );
+  const [settings, setSettings] = useState(Boolean(initialSettings)),
+    [section, setSection] = useState(initialSettings?.[1] || 'appearance');
   const [now, setNow] = useState(Date.now()),
     [busy, setBusy] = useState(false),
     [query, setQuery] = useState('');
@@ -241,15 +244,30 @@ function App() {
       </main>
     );
   const { config, session, judgment } = state;
+  const activeSession = Boolean(session && session.ends > now);
+  const automatic = Boolean(config.autoClassify && !activeSession);
+  const hasContext = Boolean(config.autoClassify || activeSession);
+  const canJudge = Boolean(hasContext && state.current && state.status?.code !== 'excluded');
+  const judgmentLabels = automatic
+    ? { ...labels, related: '工作或学习', unrelated: '娱乐或消遣' }
+    : labels;
+  const checkStatus = typeof state.status === 'string' ? state.status : state.status?.message;
   const task = (
     <div class="task-card">
       <div class="task-heading">
-        <span class="eyebrow">当前研究</span>
+        <span class="eyebrow">{activeSession ? '当前研究' : '浏览判断'}</span>
         {session && <Timer session={session} now={now} />}
       </div>
       {session ? (
         <>
           <strong class="task-goal">{session.goal}</strong>
+          {!activeSession && (
+            <p class="fine">
+              {config.autoClassify
+                ? '本轮已结束，已切回工作 / 学习与娱乐的自动判断。'
+                : '本轮已结束，开始或续时后恢复内容判断。'}
+            </p>
+          )}
           <div class="task-actions">
             <Button secondary small disabled={busy} onClick={() => act('extend')}>
               续时 {config.extendMinutes} 分钟
@@ -260,23 +278,32 @@ function App() {
           </div>
         </>
       ) : (
-        <form
-          onSubmit={async (e) => {
-            e.preventDefault();
-            await act('start', { goal });
-          }}
-        >
-          <input
-            aria-label="研究目标"
-            placeholder="例如：寻找 TrackMate 轨迹分析教程"
-            value={goal}
-            maxLength={200}
-            onInput={(e) => setGoal(e.target.value)}
-          />
-          <Button small disabled={busy || !goal.trim()}>
-            开始研究
-          </Button>
-        </form>
+        <>
+          <p class="fine">
+            {!config.aiEnabled
+              ? 'AI 内容判断已关闭，可在设置中开启。研究目标可选填。'
+              : config.autoClassify
+              ? '自动模式已开启。研究目标可选填，填写后按这次任务判断资料相关性。'
+              : '自动模式已关闭，填写研究目标后才会判断页面内容。'}
+          </p>
+          <form
+            onSubmit={async (e) => {
+              e.preventDefault();
+              await act('start', { goal });
+            }}
+          >
+            <input
+              aria-label="研究目标"
+              placeholder="例如：寻找 TrackMate 轨迹分析教程"
+              value={goal}
+              maxLength={200}
+              onInput={(e) => setGoal(e.target.value)}
+            />
+            <Button small disabled={busy || !goal.trim()}>
+              开始研究
+            </Button>
+          </form>
+        </>
       )}
     </div>
   );
@@ -322,13 +349,13 @@ function App() {
         {location.hash === '#ai' && (
           <button
             class="text-button"
-            disabled={busy || !blocked || !session}
+            disabled={busy || !blocked || !hasContext}
             onClick={async () => {
               if (await act('feedback', { label: 'related', remember: false, ai: true }))
                 setNotice('已纠正本次判断；当前页面仍保持拦截，可单独选择短时放行。');
             }}
           >
-            这页与研究相关，纠正判断
+            {automatic ? '这页属于工作或学习，纠正判断' : '这页与研究相关，纠正判断'}
           </button>
         )}
         <p class="fine">放行只适用于当前标签页的这个网址，到期恢复拦截。</p>
@@ -367,10 +394,16 @@ function App() {
             <Icon name="shield" size={18} />
             <span>
               {state.checking
-                ? '正在对照研究目标…'
+                ? automatic
+                  ? '正在判断工作 / 学习与娱乐…'
+                  : '正在对照研究目标…'
                 : judgment
-                ? labels[judgment.label]
-                : '等待研究任务与页面稳定停留'}
+                ? judgmentLabels[judgment.label]
+                : config.autoClassify
+                ? '等待页面稳定停留'
+                : activeSession
+                ? '等待资料页稳定停留'
+                : '填写研究目标后开始判断'}
             </span>
           </div>
           {judgment && (
@@ -386,16 +419,30 @@ function App() {
               </p>
             </>
           )}
-          {state.error && <p class="error">{state.error}</p>}
+          {checkStatus && !state.checking && (
+            <p class="fine detection-status" role="status">
+              {checkStatus}
+            </p>
+          )}
+          {state.error && (
+            <div class="error ai-error" role="alert" aria-live="assertive">
+              <strong>AI 判断暂不可用</strong>
+              <p>{state.error}</p>
+              <p>当前资料页保持开放，网址拦截继续生效。请检查 AI 地址、模型和访问权限。</p>
+              <button class="text-button" onClick={() => openSettingsPage('ai')}>
+                打开 AI 连接设置
+              </button>
+            </div>
+          )}
           <Button
             secondary
             small
-            disabled={busy || state.checking || !session}
+            disabled={busy || state.checking || !config.aiEnabled || !canJudge}
             onClick={() => act('check')}
           >
             检查当前页面
           </Button>
-          <small class="fine block">手动检查也遵守稳定停留、最小间隔和每小时限额。</small>
+          <small class="fine block">手动检查可跳过稳定停留等待，仍遵守最小间隔和每小时限额。</small>
         </section>
         <section class="feedback">
           <span class="eyebrow">判断不合适？</span>
@@ -403,10 +450,18 @@ function App() {
             {['related', 'unrelated', 'uncertain'].map((label) => (
               <button
                 key={label}
-                disabled={busy || !session || !state.current}
+                disabled={busy || !canJudge}
                 onClick={() => act('feedback', { label, remember })}
               >
-                {label === 'related' ? '在查资料' : label === 'unrelated' ? '确实走神' : '暂不判断'}
+                {label === 'related'
+                  ? automatic
+                    ? '工作或学习'
+                    : '在查资料'
+                  : label === 'unrelated'
+                  ? automatic
+                    ? '娱乐消遣'
+                    : '确实走神'
+                  : '暂不判断'}
               </button>
             ))}
           </div>
@@ -416,7 +471,7 @@ function App() {
               checked={remember}
               onChange={(e) => setRemember(e.target.checked)}
             />
-            以后同一目标、同一页也这样判断
+            {automatic ? '以后同一页也这样判断（自动模式）' : '以后同一目标、同一页也这样判断'}
           </label>
         </section>
         {alerts}
@@ -811,12 +866,20 @@ function Settings({ config, section, setSection, onClose, save, act, state }) {
               )}
               {section === 'ai' && (
                 <>
-                  <p class="section-intro">对照当前目标判断资料页。信息不足时保留不确定。</p>
+                  <p class="section-intro">
+                    判断工作 /
+                    学习与娱乐；有研究任务时，进一步判断与本次目标的相关性。信息不足时保留不确定。
+                  </p>
                   <div class="settings-card">
                     {toggle(
                       'aiEnabled',
                       '启用 AI 判断',
-                      '只在研究任务有效、页面位于前台且稳定停留后调用。'
+                      '只在普通页面位于前台、稳定停留且不处于隐私窗口时调用。'
+                    )}
+                    {toggle(
+                      'autoClassify',
+                      '没有研究任务时，自动判断工作/学习与娱乐',
+                      '关闭后，仅在研究任务有效时判断。Google 搜索结果不分析，只判断点开后的最终网页；已知私密页面始终排除。'
                     )}
                     <Field label="NAS / Ollama 地址" help="只支持本机或局域网 IPv4 地址。">
                       <input value={draft.aiHost} onInput={(e) => set('aiHost', e.target.value)} />
@@ -859,7 +922,7 @@ function Settings({ config, section, setSection, onClose, save, act, state }) {
                       '摘要由 Mozilla Readability 提取，最多发送下方指定字符数。视频页不下载视频、不读取音频。'
                     )}
                     {numeric('excerptChars', '正文摘录上限（字符）', 300, 4000)}
-                    {select('aiAction', '明确偏离目标时', [
+                    {select('aiAction', '明确娱乐或偏离目标时', [
                       ['remind', '提醒，保留当前页面'],
                       ['block', '高置信度时拦截，保留短时放行入口'],
                     ])}
@@ -874,7 +937,7 @@ function Settings({ config, section, setSection, onClose, save, act, state }) {
                       {numeric('dwellSeconds', '稳定停留（秒）', 10, 180)}
                       {numeric('intervalSeconds', '请求最小间隔（秒）', 30, 900)}
                       {numeric('requestsPerHour', '每小时最多请求', 1, 60)}
-                      {numeric('cacheMinutes', '同任务页面缓存（分钟）', 1, 120)}
+                      {numeric('cacheMinutes', '同一判断上下文的页面缓存（分钟）', 1, 120)}
                     </div>
                     {select(
                       'keepAlive',
@@ -967,7 +1030,7 @@ function Settings({ config, section, setSection, onClose, save, act, state }) {
                   <div class="settings-card">
                     <h3>AI 能看到什么</h3>
                     <p>
-                      本次研究目标、当前页面标题、清洗后的网址；开启正文模式时，还包括有长度上限的正文摘录。只发送至你设置的
+                      当前判断模式、可选的研究目标、当前页面标题、清洗后的网址；开启正文模式时，还包括有长度上限的正文摘录。只发送至你设置的
                       NAS 地址，不发送整段浏览历史。
                     </p>
                     <p>
@@ -982,7 +1045,7 @@ function Settings({ config, section, setSection, onClose, save, act, state }) {
                   <div class="settings-card">
                     <h3>纠错与反馈</h3>
                     <p>
-                      工具栏弹窗可标记“在查资料”“确实走神”“暂不判断”。纠正仅匹配同一目标、同一页面标题与网址。选择“以后也这样判断”才跨研究轮次复用。
+                      自动模式可标记“工作或学习”“娱乐消遣”“暂不判断”；研究模式可标记“在查资料”“确实走神”“暂不判断”。纠正仅匹配同一判断模式、同一目标（如有）、同一页面标题与网址。选择“以后也这样判断”才跨研究轮次复用。
                     </p>
                     <p class="fine">
                       这是本地纠正规则，不会训练或修改 NAS 模型。最多保存 200 条，支持撤销和清除。

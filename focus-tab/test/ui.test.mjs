@@ -80,6 +80,7 @@ async function settings(window, section) {
   }
 }
 function extensionMock(window, state, calls) {
+  window.testStorageListeners = [];
   window.chrome = {
     runtime: {
       id: 'focus-ui-test',
@@ -100,8 +101,21 @@ function extensionMock(window, state, calls) {
         };
       },
     },
-    storage: { onChanged: { addListener() {}, removeListener() {} } },
-    tabs: { async create() {} },
+    storage: {
+      onChanged: {
+        addListener(listener) {
+          window.testStorageListeners.push(listener);
+        },
+        removeListener(listener) {
+          window.testStorageListeners = window.testStorageListeners.filter((fn) => fn !== listener);
+        },
+      },
+    },
+    tabs: {
+      async create(payload) {
+        calls.push({ type: 'tabs:create', payload });
+      },
+    },
   };
 }
 
@@ -313,6 +327,216 @@ test('preview searches honor the saved task reuse setting and reject invalid tim
     await assert.rejects(request('start', { goal: '测试', minutes: 0 }), /sessionMinutes/);
     await request('end');
     await assert.rejects(request('extend'), /请先开始一次研究/);
+  } finally {
+    dom.window.disposeUI();
+    dom.window.close();
+  }
+});
+
+test('automatic popup allows checking and correcting without a research task and exposes AI errors', async () => {
+  const calls = [],
+    state = {
+      config: { ...structuredClone(DEFAULTS), autoClassify: true },
+      session: null,
+      current: { title: '单粒子追踪教程', url: 'https://www.bilibili.com/video/BVresearch' },
+      judgment: null,
+      checking: false,
+      feedback: [],
+      error: 'AI 暂不可用：403 Forbidden',
+      status: { mode: 'auto', code: 'error', message: '上次请求失败，请检查连接设置' },
+    };
+  const dom = await mount({
+    page: 'popup',
+    setup(window) {
+      extensionMock(window, state, calls);
+    },
+  });
+  try {
+    const { document } = dom.window;
+    assert.match(document.querySelector('.task-card').textContent, /研究目标可选填/);
+    assert.match(document.querySelector('.judgment').textContent, /等待页面稳定停留/);
+    assert.equal(button(document, '检查当前页面').disabled, false);
+    assert.equal(button(document, '工作或学习').disabled, false);
+    assert.equal(button(document, '娱乐消遣').disabled, false);
+    assert.match(document.querySelector('.ai-error[role="alert"]').textContent, /403 Forbidden/);
+    assert.match(document.querySelector('.detection-status').textContent, /上次请求失败/);
+    button(document, '检查当前页面').click();
+    await until(() => calls.some((call) => call.type === 'focus:check'));
+    await until(() => !button(document, '工作或学习').disabled);
+    button(document, '工作或学习').click();
+    await until(() => calls.some((call) => call.type === 'focus:feedback'));
+    assert.deepEqual(calls.find((call) => call.type === 'focus:feedback').payload, {
+      label: 'related',
+      remember: false,
+    });
+    button(document, '打开 AI 连接设置').click();
+    assert.equal(
+      calls.find((call) => call.type === 'tabs:create').payload.url,
+      'chrome-extension://focus-ui-test/index.html#settings/ai'
+    );
+  } finally {
+    dom.window.disposeUI();
+    dom.window.close();
+  }
+});
+
+test('task-only mode requires a live task and excluded pages disable checking and feedback', async () => {
+  for (const item of [
+    { autoClassify: false, session: null, code: 'waiting-task', enabled: false },
+    {
+      autoClassify: false,
+      session: { id: 'expired', goal: '研究', started: Date.now() - 600000, ends: Date.now() - 1 },
+      code: 'waiting-task',
+      enabled: false,
+    },
+    {
+      autoClassify: false,
+      session: { id: 'active', goal: '研究', started: Date.now(), ends: Date.now() + 600000 },
+      code: 'ready',
+      enabled: true,
+    },
+    { autoClassify: true, session: null, code: 'excluded', enabled: false },
+  ]) {
+    const state = {
+      config: { ...structuredClone(DEFAULTS), autoClassify: item.autoClassify },
+      session: item.session,
+      current: { title: '网页', url: 'https://www.bilibili.com/video/BVresearch' },
+      checking: false,
+      feedback: [],
+      judgment: null,
+      status: {
+        code: item.code,
+        mode: item.autoClassify ? 'auto' : 'task',
+        message: item.code === 'excluded' ? 'Google 搜索结果不分析，请打开最终网页' : '',
+      },
+    };
+    const dom = await mount({
+      page: 'popup',
+      setup(window) {
+        extensionMock(window, state, []);
+      },
+    });
+    try {
+      const { document } = dom.window;
+      assert.equal(button(document, '检查当前页面').disabled, !item.enabled, JSON.stringify(item));
+      assert.equal(
+        document.querySelector('.feedback-buttons button').disabled,
+        !item.enabled,
+        JSON.stringify(item)
+      );
+      if (item.code === 'excluded')
+        assert.match(document.querySelector('.detection-status').textContent, /最终网页/);
+    } finally {
+      dom.window.disposeUI();
+      dom.window.close();
+    }
+  }
+});
+
+test('automatic mode setting persists without replacing a saved reminder preference', async () => {
+  const dom = await mount({
+    hash: '#settings/ai',
+    setup(window) {
+      window.localStorage.setItem('focus-preview-config', JSON.stringify({ aiAction: 'remind' }));
+    },
+  });
+  try {
+    const { window } = dom;
+    await until(() => window.document.querySelector('dialog')?.open);
+    assert.equal(window.document.querySelector('#settings-title').textContent, '内容判断');
+    const toggle = [...window.document.querySelectorAll('.toggle-field')].find(
+      (el) =>
+        el.querySelector('.field-title')?.textContent === '没有研究任务时，自动判断工作/学习与娱乐'
+    );
+    assert.ok(toggle);
+    assert.match(toggle.textContent, /Google 搜索结果不分析/);
+    const checkbox = toggle.querySelector('input');
+    assert.equal(checkbox.checked, true);
+    checkbox.checked = false;
+    checkbox.dispatchEvent(new window.Event('change', { bubbles: true }));
+    await until(() => !!button(window.document, '保存设置'));
+    button(window.document, '保存设置').click();
+    await until(() => button(window.document, '已保存')?.disabled);
+    const saved = JSON.parse(window.localStorage.getItem('focus-preview-config'));
+    assert.equal(saved.autoClassify, false);
+    assert.equal(saved.aiAction, 'remind');
+  } finally {
+    dom.window.disposeUI();
+    dom.window.close();
+  }
+});
+
+test('automatic AI blocks can be corrected without a task and do not silently pass the page', async () => {
+  const calls = [],
+    state = {
+      config: { ...structuredClone(DEFAULTS), autoClassify: true },
+      session: null,
+      current: null,
+      judgment: null,
+      checking: false,
+      feedback: [],
+      status: { mode: 'auto', code: 'no-page', message: '' },
+    };
+  const dom = await mount({
+    page: 'blocked',
+    hash: '#ai',
+    setup(window) {
+      extensionMock(window, state, calls);
+    },
+  });
+  try {
+    const { document } = dom.window;
+    await until(
+      () =>
+        button(document, '这页属于工作或学习，纠正判断') &&
+        !button(document, '这页属于工作或学习，纠正判断').disabled
+    );
+    button(document, '这页属于工作或学习，纠正判断').click();
+    await until(() => calls.some((call) => call.type === 'focus:feedback'));
+    assert.deepEqual(calls.find((call) => call.type === 'focus:feedback').payload, {
+      label: 'related',
+      remember: false,
+      ai: true,
+    });
+    assert.equal(
+      calls.some((call) => call.type === 'focus:pass'),
+      false
+    );
+  } finally {
+    dom.window.disposeUI();
+    dom.window.close();
+  }
+});
+
+test('background automatic-status refresh does not replace an unsaved settings draft', async () => {
+  const calls = [],
+    state = {
+      config: structuredClone(DEFAULTS),
+      session: null,
+      current: null,
+      judgment: null,
+      checking: false,
+      feedback: [],
+      status: { mode: 'auto', code: 'no-page', message: '等待网页' },
+    };
+  const dom = await mount({
+    setup(window) {
+      extensionMock(window, state, calls);
+    },
+  });
+  try {
+    const { window } = dom;
+    await settings(window);
+    input(window, field(window.document, '首页标题'), '我的未保存标题');
+    await until(() => !!button(window.document, '保存设置'));
+    state.config.title = '后台更新的标题';
+    state.status = { mode: 'auto', code: 'checking', message: '正在检测' };
+    const before = calls.length;
+    for (const listener of window.testStorageListeners) listener({ focusRuntime: {} });
+    await until(() => calls.length > before);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(field(window.document, '首页标题').value, '我的未保存标题');
+    assert.equal(button(window.document, '保存设置').disabled, false);
   } finally {
     dom.window.disposeUI();
     dom.window.close();

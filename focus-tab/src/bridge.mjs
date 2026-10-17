@@ -23,9 +23,13 @@ function previewSession(value) {
     : null;
 }
 
-export function openSettingsPage() {
-  if (isExtension) return chrome.tabs.create({ url: chrome.runtime.getURL('index.html#settings') });
-  return globalThis.open(new URL('index.html#settings', location.href).href, '_blank', 'noopener');
+export function openSettingsPage(section = 'appearance') {
+  const supported = ['appearance', 'links', 'task', 'ai', 'blocking', 'privacy'];
+  const hash =
+    supported.includes(section) && section !== 'appearance' ? `#settings/${section}` : '#settings';
+  const target = 'index.html' + hash;
+  if (isExtension) return chrome.tabs.create({ url: chrome.runtime.getURL(target) });
+  return globalThis.open(new URL(target, location.href).href, '_blank', 'noopener');
 }
 
 export async function request(type, payload = {}) {
@@ -45,6 +49,7 @@ export async function request(type, payload = {}) {
     calls: 0,
     feedback: [],
     checking: false,
+    status: '这是界面预览；安装扩展后，在普通网页中查看实际检测状态。',
   };
   if (type === 'config') {
     state.config = { ...state.config, ...validatePatch(payload) };

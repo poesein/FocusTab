@@ -3,7 +3,7 @@
   "name": "FocusTab · 专注",
   "short_name": "专注",
   "description": "中文新标签页、科研任务相关性判断与热点入口拦截。数据在浏览器与您指定的本机或局域网 AI 之间处理。",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwVRrO4SkB+1SKbJrRsTGGy7Gjbi9mNzS6FY26RHEN/Hx1I5zxhirgPT/NFL2uUUC0HeGmFPGDcInEW3guVhaURooDHUE2bHI7TI379oqIPlVKKdEpdzdYWeL2sDDdmwlvsYXyX0GGfk+JZbYXMM1QOsrBKAyuBFFLuSZ9TliEy5tz7XE1wAM7Jp145XpHUJP1hkmE+3o9DIFHK4xBm1XI53gpC0yPriB9q+B93YWEiXCULFEuTgAXFWMG+e/PtIOh7Llwd84ztal6yAqkVrR8hG06Iyg6+DcCKrT6oHLbifayryP9Y2pajQ9JK2VD++20OErUr78B5GXKMehXs7TvQIDAQAB",
   "minimum_chrome_version": "120",
   "incognito": "not_allowed",
@@ -17,10 +17,18 @@
   "action": {
     "default_title": "专注助手",
     "default_popup": "popup.html",
-    "default_icon": { "16": "icons/icon-16.png", "32": "icons/icon-32.png" }
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png"
+    }
   },
-  "background": { "service_worker": "background.js", "type": "module" },
-  "chrome_url_overrides": { "newtab": "index.html" },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "chrome_url_overrides": {
+    "newtab": "index.html"
+  },
   "options_page": "index.html#settings",
   "permissions": [
     "tabs",
@@ -34,7 +42,10 @@
   ],
   "host_permissions": ["http://*/*", "https://*/*"],
   "web_accessible_resources": [
-    { "resources": ["blocked.html", "app.js", "app.css"], "matches": ["http://*/*", "https://*/*"] }
+    {
+      "resources": ["blocked.html", "app.js", "app.css"],
+      "matches": ["http://*/*", "https://*/*"]
+    }
   ],
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"

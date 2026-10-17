@@ -42,10 +42,41 @@ test('large DOM/video pages fall back to metadata; negative/excessive lengths st
   for (let i = 0; i < 15001; i++) fragment.append(dom.window.document.createElement('span'));
   dom.window.document.body.append(fragment);
   const page = extractPage(dom.window.document, 99999);
-  assert.equal(page.method, 'metadata');
+  assert.equal(page.method, 'video-description');
   assert.match(page.excerpt, /公开视频说明/);
   assert.ok(!page.excerpt.includes('contact@example.org'));
   assert.equal(extractPage(dom.window.document, -500).excerpt, '');
+});
+
+test('Bilibili video extraction includes only the actual title, description and tags, never recommendation rails', () => {
+  const dom = new JSDOM(
+    `<!doctype html><html><head><title>TrackMate教程_哔哩哔哩</title><meta name="description" content="TrackMate图像分析"></head><body>
+    <main><h1 class="video-title" title="TrackMate 单粒子追踪教程">视频标题</h1><div id="v_desc"><div class="basic-desc-info">真实视频：显微图像分割与单粒子追踪。</div><form>表单秘密<input value="私人输入"></form></div><div class="video-tag-container"><a class="tag-link">科研</a><a class="tag">生物图像</a></div></main>
+    <section class="recommend-list"><h2>娱乐推荐</h2><article><p>${'八卦游戏搞笑综艺推荐，完全不属于该视频。'.repeat(
+      200
+    )}</p></article></section>
+  </body></html>`,
+    { url: 'https://www.bilibili.com/video/BVpublic/' }
+  );
+  const page = extractPage(dom.window.document);
+  assert.equal(page.title, 'TrackMate 单粒子追踪教程');
+  assert.equal(page.method, 'video-description');
+  assert.match(page.excerpt, /真实视频.*科研.*生物图像/);
+  assert.ok(!page.excerpt.includes('八卦游戏'));
+  assert.ok(!page.excerpt.includes('表单秘密'));
+});
+
+test('missing video descriptions use bounded metadata without falling back to side-rail Readability', () => {
+  const dom = new JSDOM(
+    `<!doctype html><html><head><title>具体娱乐视频</title><meta name="description" content="六位up主齐聚别墅，游戏失败者淘汰回家。"></head><body><h1>输了就滚蛋！ 下一个是谁？</h1><div class="recommend-list"><article>${'TrackMate科研教程推荐'.repeat(
+      100
+    )}</article></div></body></html>`,
+    { url: 'https://www.bilibili.com/video/BVpublic/' }
+  );
+  const page = extractPage(dom.window.document);
+  assert.equal(page.title, '输了就滚蛋！ 下一个是谁？');
+  assert.match(page.excerpt, /游戏失败者淘汰回家/);
+  assert.ok(!page.excerpt.includes('TrackMate科研教程推荐'));
 });
 
 test('page instructions remain quoted untrusted user data and metadata mode excludes body text', () => {

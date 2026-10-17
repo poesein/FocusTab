@@ -21,6 +21,13 @@
 * {
   box-sizing: border-box;
 }
+/* A browser userscript can append RSS+ outside the app on the localhost UI
+ * preview. Its inline styling is blocked by CSP, exposing its entire settings
+ * panel. Keep this one foreign widget out of the focus surface; other websites
+ * and the user's RSS script preferences are unaffected. */
+body > #rss-plus-shadow-host {
+  display: none !important;
+}
 body {
   margin: 0;
 }

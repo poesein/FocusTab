@@ -85,9 +85,58 @@ export function cleanURL(raw) {
   return u.href;
 }
 
+export function isSearchResults(raw) {
+  const u = httpURL(raw);
+  if (!u) return false;
+  const host = u.hostname,
+    path = u.pathname;
+  // Match Google domains, not similarly named content hosts such as
+  // googleusercontent.com. Only search/redirect entry routes are excluded.
+  if (
+    /(^|\.)google\.(?:com|[a-z]{2,3}|com\.[a-z]{2}|co\.[a-z]{2})$/.test(host) &&
+    /^\/(?:$|search(?:\/|$)|webhp(?:\/|$)|imghp(?:\/|$)|videohp(?:\/|$)|scholar(?:\/|$)|url(?:\/|$))/.test(
+      path
+    )
+  )
+    return true;
+  if (
+    (hostIs(host, 'bing.com') || hostIs(host, 'bing.cn')) &&
+    /^\/(?:$|search(?:\/|$)|(?:images|videos|news)\/search(?:\/|$))/.test(path)
+  )
+    return true;
+  if (hostIs(host, 'duckduckgo.com') && /^\/(?:$|html\/?$|lite\/?$)/.test(path)) return true;
+  if (
+    (host === 'search.yahoo.com' ||
+      host === 'search.brave.com' ||
+      host === 'www.ecosia.org' ||
+      host === 'ecosia.org') &&
+    /^\/(?:$|search(?:\/|$))/.test(path)
+  )
+    return true;
+  if (
+    hostIs(host, 'baidu.com') &&
+    /^\/(?:$|s(?:\/|$)|baidu(?:\/|$)|sf\/vsearch(?:\/|$))/.test(path)
+  )
+    return true;
+  if (
+    host === 'search.bilibili.com' ||
+    (hostIs(host, 'zhihu.com') && /^\/search(?:\/|$)/.test(path)) ||
+    (hostIs(host, 'youtube.com') && /^\/results(?:\/|$)/.test(path)) ||
+    ((hostIs(host, 'x.com') || hostIs(host, 'twitter.com')) && /^\/search(?:\/|$)/.test(path))
+  )
+    return true;
+  return false;
+}
+
 export function canAnalyze(raw, config) {
   const u = httpURL(raw);
-  if (!u || u.username || u.password || !config.analysisHosts.some((h) => hostIs(u.hostname, h)))
+  if (
+    !u ||
+    u.username ||
+    u.password ||
+    isSearchResults(raw) ||
+    !config.analysisHosts.some((h) => hostIs(u.hostname, h))
+  )
     return false;
   // Account, message and private application routes are never sent to the model.
   if (
@@ -107,6 +156,7 @@ export function canAnalyze(raw, config) {
     /^(?:member|message|account|passport)\./.test(u.hostname)
   )
     return false;
+  if (/^(?:docs|drive|mail|calendar|accounts)\.google\./.test(u.hostname)) return false;
   return !blockedBy(raw, config);
 }
 
