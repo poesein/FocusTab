@@ -119,6 +119,29 @@ function Toggle({ label, help, value, onChange }) {
     </label>
   );
 }
+function HostEditor({ hosts, onChange }) {
+  const parse = (text) =>
+    text
+      .split('\n')
+      .map((line) => line.trim().toLowerCase())
+      .filter(Boolean);
+  const [text, setText] = useState(hosts.join('\n'));
+  useEffect(() => {
+    // Preserve the in-progress last line. External settings and imports still
+    // replace the editor when their normalized domains actually differ.
+    if (JSON.stringify(hosts) !== JSON.stringify(parse(text))) setText(hosts.join('\n'));
+  }, [hosts]);
+  return (
+    <textarea
+      rows={7}
+      value={text}
+      onInput={(event) => {
+        setText(event.target.value);
+        onChange(parse(event.target.value));
+      }}
+    />
+  );
+}
 function Timer({ session, now }) {
   const seconds = Math.max(0, Math.ceil((session.ends - now) / 1000));
   return (
@@ -570,10 +593,10 @@ function App() {
           </div>
         )}
         <div class="blocked-actions">
-          <a class="button" href="index.html">
-            回到搜索 <Icon name="arrow" size={17} />
+          <a class="button secondary blocked-navigation" href="index.html">
+            回到搜索
           </a>
-          <a class="button secondary" href="https://weread.qq.com/" rel="noreferrer">
+          <a class="button blocked-navigation" href="https://weread.qq.com/" rel="noreferrer">
             看会书吧
           </a>
           {passEnabled && (
@@ -860,25 +883,47 @@ function App() {
 
 function Settings({ config, section, setSection, onClose, save, act, state }) {
   const dialog = useRef(),
+    baseline = useRef(config),
+    operation = useRef(false),
     [draft, setDraft] = useState(structuredClone(config)),
     [status, setStatus] = useState(''),
     [error, setError] = useState('');
   const [saving, setSaving] = useState(false),
+    [running, setRunning] = useState(false),
     [goal, setGoal] = useState(state.session?.goal || ''),
     [clear, setClear] = useState(false);
   const importFile = useRef(),
     closeRef = useRef();
   const set = (key, value) => {
+    if (operation.current) return;
     setDraft((d) => ({ ...d, [key]: value }));
     setStatus('有未保存的修改');
     setError('');
   };
   const dirty = JSON.stringify(draft) !== JSON.stringify(config);
   const close = () => {
+    if (operation.current) return;
     if (dirty && !confirm('还有未保存的设置。要放弃这些修改并关闭吗？')) return;
     onClose();
   };
   closeRef.current = close;
+  useEffect(() => {
+    // Keep local edits, while accepting other windows' changes to untouched
+    // fields. Commit only the resulting delta so stale fields cannot overwrite
+    // a newer backend setting that has not reached this page yet.
+    const previous = baseline.current;
+    baseline.current = config;
+    setDraft((current) =>
+      Object.fromEntries(
+        Object.entries(config).map(([key, value]) => [
+          key,
+          JSON.stringify(current[key]) === JSON.stringify(previous[key])
+            ? structuredClone(value)
+            : current[key],
+        ])
+      )
+    );
+  }, [config]);
   useEffect(() => {
     const el = dialog.current;
     el.showModal();
@@ -898,26 +943,41 @@ function Settings({ config, section, setSection, onClose, save, act, state }) {
     return () => el.removeEventListener('cancel', cancel);
   }, []);
   async function run(type, payload = {}) {
+    if (operation.current) return null;
+    operation.current = true;
+    setRunning(true);
     setError('');
     try {
       return await act(type, payload, true);
     } catch (e) {
       setError(e.message);
       return null;
+    } finally {
+      operation.current = false;
+      setRunning(false);
     }
   }
   async function commit(e) {
     e?.preventDefault();
+    if (operation.current) return;
+    operation.current = true;
     setSaving(true);
     setError('');
     try {
-      const checked = validatePatch(draft);
+      const checked = validatePatch(
+        Object.fromEntries(
+          Object.entries(draft).filter(
+            ([key, value]) => JSON.stringify(value) !== JSON.stringify(baseline.current[key])
+          )
+        )
+      );
       const saved = await save(checked);
       setDraft(structuredClone(saved));
       setStatus('已保存');
     } catch (e) {
       setError(e.message);
     } finally {
+      operation.current = false;
       setSaving(false);
     }
   }
@@ -951,7 +1011,10 @@ function Settings({ config, section, setSection, onClose, save, act, state }) {
   }
   async function importSettings(event) {
     const file = event.target.files?.[0];
-    if (!file) return;
+    if (!file || operation.current) return;
+    operation.current = true;
+    setRunning(true);
+    setError('');
     try {
       if (file.size > 200000) throw new Error('设置文件过大');
       let parsed;
@@ -968,8 +1031,11 @@ function Settings({ config, section, setSection, onClose, save, act, state }) {
       setError('');
     } catch (e) {
       setError(e.message);
+    } finally {
+      operation.current = false;
+      setRunning(false);
+      event.target.value = '';
     }
-    event.target.value = '';
   }
   const tabs = [
     ['appearance', '界面与文字', '01'],
@@ -1057,12 +1123,22 @@ function Settings({ config, section, setSection, onClose, save, act, state }) {
               <span class="eyebrow">PREFERENCES</span>
               <h2 id="settings-title">{tabs.find((t) => t[0] === section)?.[1] || '设置'}</h2>
             </div>
-            <button class="icon-button" aria-label="关闭设置" onClick={close}>
+            <button
+              class="icon-button"
+              aria-label="关闭设置"
+              disabled={saving || running}
+              onClick={close}
+            >
               <Icon name="close" />
             </button>
           </header>
           <form class="settings-form" onSubmit={commit}>
-            <div class="settings-scroll">
+            <fieldset
+              class="settings-scroll"
+              disabled={saving || running}
+              aria-busy={saving || running}
+              aria-labelledby="settings-title"
+            >
               {section === 'appearance' && (
                 <>
                   <p class="section-intro">让每一次打开，都从自己的问题开始。</p>
@@ -1250,18 +1326,9 @@ function Settings({ config, section, setSection, onClose, save, act, state }) {
                       label="允许判断的网站"
                       help="每行一个域名。包含其子域名，但账户、私信等已知私密路径仍会排除。只添加你愿意发送页面信息的公开内容网站。"
                     >
-                      <textarea
-                        rows={7}
-                        value={draft.analysisHosts.join('\n')}
-                        onInput={(e) =>
-                          set(
-                            'analysisHosts',
-                            e.target.value
-                              .split('\n')
-                              .map((s) => s.trim().toLowerCase())
-                              .filter(Boolean)
-                          )
-                        }
+                      <HostEditor
+                        hosts={draft.analysisHosts}
+                        onChange={(hosts) => set('analysisHosts', hosts)}
                       />
                     </Field>
                   </div>
@@ -1430,14 +1497,14 @@ function Settings({ config, section, setSection, onClose, save, act, state }) {
                   </p>
                 </>
               )}
-            </div>
+            </fieldset>
             <footer class="settings-footer">
               <div aria-live={error ? 'assertive' : 'polite'} role={error ? 'alert' : 'status'}>
                 <span class={error ? 'error-text' : dirty ? 'muted' : 'saved'}>
                   {error || status || '设置保存在当前浏览器'}
                 </span>
               </div>
-              <Button disabled={saving || !dirty} icon={dirty ? undefined : 'check'}>
+              <Button disabled={saving || running || !dirty} icon={dirty ? undefined : 'check'}>
                 {saving ? '正在保存…' : dirty ? '保存设置' : '已保存'}
               </Button>
             </footer>

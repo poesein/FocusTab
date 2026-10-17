@@ -129,11 +129,23 @@ export function cleanURL(raw) {
   return u.href;
 }
 
+function analysisPath(u) {
+  // URL.pathname preserves escapes. Decode ASCII route markers once for the
+  // privacy/search exclusions, including encoded separators. This never changes
+  // the requested URL, document identity or the static blocking expressions.
+  return u.pathname
+    .replace(/%([0-9a-f]{2})/gi, (encoded, hex) => {
+      const value = Number.parseInt(hex, 16);
+      return value < 128 ? String.fromCharCode(value) : encoded;
+    })
+    .replace(/\\/g, '/');
+}
+
 export function isSearchResults(raw) {
   const u = httpURL(raw);
   if (!u) return false;
   const host = u.hostname,
-    path = u.pathname;
+    path = analysisPath(u);
   // Match Google domains, not similarly named content hosts such as
   // googleusercontent.com. Only search/redirect entry routes are excluded.
   if (
@@ -175,47 +187,48 @@ export function isSearchResults(raw) {
 
 function isPrivatePage(u) {
   if (u.username || u.password) return true;
+  const path = analysisPath(u);
   // Account, message and private application routes are never sent to the model.
   if (
     /\/(?:messages?|settings|notifications|login|signin|logout|signup|account|passport|checkout|payment|history|orders?|inbox|wallet|billing)(?:\/|$)/i.test(
-      u.pathname
+      path
     )
   )
     return true;
   if (
     /^\/(?:i\/(?:chat|flow|bookmarks)|feed\/(?:history|subscriptions|library)|creator|my|favorites|watchlater)(?:\/|$)/i.test(
-      u.pathname
+      path
     )
   )
     return true;
   if (hostIs(u.hostname, 'bilibili.com')) {
     if (/^(?:member|message|account|passport)\./.test(u.hostname)) return true;
-    if (/^\/(?:list|medialist\/play)\/watchlater(?:\/|$)/i.test(u.pathname)) return true;
+    if (/^\/(?:list|medialist\/play)\/watchlater(?:\/|$)/i.test(path)) return true;
     if (
       hostIs(u.hostname, 'space.bilibili.com') &&
-      /^\/(?:[0-9]+|self)\/favlist(?:\/|$)/i.test(u.pathname)
+      /^\/(?:[0-9]+|self)\/favlist(?:\/|$)/i.test(path)
     )
       return true;
   }
   if (hostIs(u.hostname, 'youtube.com')) {
     if (hostIs(u.hostname, 'studio.youtube.com')) return true;
     if (
-      /^\/feed\/(?:you|playlists|channels|downloads|purchases)(?:\/|$)/i.test(u.pathname) ||
-      /^\/(?:account(?:_|\/|$)|paid_memberships(?:\/|$))/i.test(u.pathname)
+      /^\/feed\/(?:you|playlists|channels|downloads|purchases)(?:\/|$)/i.test(path) ||
+      /^\/(?:account(?:_|\/|$)|paid_memberships(?:\/|$))/i.test(path)
     )
       return true;
-    if (/^\/playlist\/?$/i.test(u.pathname) && ['WL', 'LL'].includes(u.searchParams.get('list')))
+    if (/^\/playlist\/?$/i.test(path) && ['WL', 'LL'].includes(u.searchParams.get('list')))
       return true;
   }
   if (
     (hostIs(u.hostname, 'x.com') || hostIs(u.hostname, 'twitter.com')) &&
-    /^\/(?:compose|drafts)(?:\/|$)/i.test(u.pathname)
+    /^\/(?:compose|drafts)(?:\/|$)/i.test(path)
   )
     return true;
   if (
     hostIs(u.hostname, 'zhihu.com') &&
-    (/^\/(?:drafts?|write)(?:\/|$)/i.test(u.pathname) ||
-      /^\/people\/[^/]+\/collections(?:\/|$)/i.test(u.pathname))
+    (/^\/(?:drafts?|write)(?:\/|$)/i.test(path) ||
+      /^\/people\/[^/]+\/collections(?:\/|$)/i.test(path))
   )
     return true;
   if (/^(?:docs|drive|mail|calendar|accounts)\.google\./.test(u.hostname)) return true;

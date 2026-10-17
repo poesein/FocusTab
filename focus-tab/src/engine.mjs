@@ -41,6 +41,7 @@ export class FocusEngine {
     this.aiTimerAt = null;
     this.aiAlarmAt = null;
     this.scheduleLoaded = false;
+    this.rulesDirty = false;
     this.runtime = {
       autoSessionId: "auto:" + crypto.randomUUID(),
       contextToken: null,
@@ -233,6 +234,7 @@ export class FocusEngine {
     }
   }
   async syncRules() {
+    this.rulesDirty = true;
     const rules = makeDNR(this.config, this.api.runtime.getURL(""));
     for (const r of rules) {
       const supported = await this.api.declarativeNetRequest.isRegexSupported({
@@ -247,6 +249,7 @@ export class FocusEngine {
       removeRuleIds: previous.map((r) => r.id),
       addRules: rules,
     });
+    this.rulesDirty = false;
   }
   cancelPending() {
     this.pending?.controller.abort();
@@ -456,7 +459,20 @@ export class FocusEngine {
       this.config,
       this.now()
     );
-    return correction?.label === "related" ? null : row;
+    // A stored redirect is evidence of a past decision, not a permanent rule.
+    // Feedback can be undone, cleared, expired or changed to "uncertain".
+    if (correction) return correction.label === "unrelated" ? row : null;
+    if (row.source === "human") return null;
+    // Old versions did not record confidence or age. Recheck those decisions
+    // through the bounded scheduler; a past redirect must not outlive its cache.
+    return Number.isFinite(row.confidence) &&
+      row.confidence >= this.config.threshold &&
+      row.confidence <= 1 &&
+      Number.isFinite(row.created) &&
+      row.created <= this.now() &&
+      this.now() - row.created < this.config.cacheMinutes * 6e4
+      ? row
+      : null;
   }
   async maintenance() {
     const now = this.now();
@@ -688,6 +704,7 @@ export class FocusEngine {
     // Expiry enforcement must also run when Chrome is unfocused, idle, or the
     // foreground is an extension/new-tab page.
     await this.maintenance();
+    if (this.rulesDirty) await this.syncRules();
     let tab;
     try {
       tab = await this.foreground();
@@ -823,8 +840,23 @@ export class FocusEngine {
     if (
       result.label !== "unrelated" ||
       result.confidence < this.config.threshold
-    )
+    ) {
+      if (!(await this.contextIsCurrent(context, active, !!this.pending)))
+        return;
+      const target = this.currentCandidate;
+      const storageKey = "aiBlock:" + target.id;
+      const prior = (await this.api.storage.session.get(storageKey))[
+        storageKey
+      ];
+      if (
+        prior &&
+        prior.source !== "human" &&
+        this.matchesContext(prior, context) &&
+        samePageURL(prior.url, target.url)
+      )
+        await this.api.storage.session.remove(storageKey);
       return;
+    }
     if (notify)
       await this.notify(
         context.mode === "auto"
@@ -837,11 +869,7 @@ export class FocusEngine {
     if (!(await this.contextIsCurrent(context, active, !!this.pending))) return;
     const target = this.currentCandidate;
     if (!target || !canAnalyze(target.url, this.config)) return;
-    if (
-      this.config.aiEnabled &&
-      this.config.aiAction === "block" &&
-      !(await this.currentPass(target.id, target.url))
-    ) {
+    if (this.config.aiEnabled && this.config.aiAction === "block") {
       await this.api.storage.session.set({
         ["aiBlock:" + target.id]: {
           url: target.url,
@@ -852,11 +880,14 @@ export class FocusEngine {
           contextId: context.id,
           mode: context.mode,
           source: result.source || "ai",
+          confidence: result.confidence,
+          created: result.created,
         },
       });
-      await this.api.tabs.update(target.id, {
-        url: this.api.runtime.getURL("blocked.html") + "#ai",
-      });
+      if (!(await this.currentPass(target.id, target.url)))
+        await this.api.tabs.update(target.id, {
+          url: this.api.runtime.getURL("blocked.html") + "#ai",
+        });
     }
   }
   reuseJudgment(result, active, context) {
@@ -964,7 +995,7 @@ export class FocusEngine {
             this.runtime.judgment,
             ...this.runtime.cache.filter((r) => r.key !== key),
           ].slice(0, 50);
-          await this.applyJudgment(result, active, context, key);
+          await this.applyJudgment(this.runtime.judgment, active, context, key);
           await this.saveRuntime();
         })
       )
@@ -1258,15 +1289,28 @@ export class FocusEngine {
       const patch = validatePatch(payload);
       const before = this.config;
       this.config = { ...before, ...patch };
+      // Extraction runs outside the serialized UI queue. Revoke its permission
+      // immediately, before any rule/storage await can let old content settings
+      // send a request after the user has switched analysis off.
+      this.cancelPending();
       try {
         await this.syncRules();
         await this.api.storage.local.set({ focusConfig: this.config });
       } catch (error) {
         this.config = before;
-        await this.syncRules();
+        try {
+          await this.syncRules();
+        } catch (restoreError) {
+          throw new Error(
+            error.message +
+              "；网址规则恢复失败：" +
+              restoreError.message +
+              "；后台将自动重试。",
+            { cause: error }
+          );
+        }
         throw error;
       }
-      this.cancelPending();
       this.runtime.cache = [];
       this.runtime.judgment = null;
       this.runtime.error = "";

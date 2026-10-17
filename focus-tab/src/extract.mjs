@@ -1,18 +1,26 @@
 import { Readability } from '@mozilla/readability';
 
 const compact = (value) => (value || '').replace(/\s+/g, ' ').trim();
+const PRIVATE_UI =
+  'input, textarea, select, form, script, style, nav, aside, [contenteditable], [hidden], [aria-hidden="true"]';
+const HIDDEN_STYLE = /display\s*:\s*none\b|visibility\s*:\s*hidden\b/i;
 function removePrivateUI(copy) {
-  copy
-    .querySelectorAll(
-      'input, textarea, select, form, script, style, nav, aside, [contenteditable], [hidden], [aria-hidden="true"]'
-    )
-    .forEach((n) => n.remove());
+  copy.querySelectorAll(PRIVATE_UI).forEach((n) => n.remove());
   copy.querySelectorAll('[style]').forEach((n) => {
-    if (/display\s*:\s*none\b|visibility\s*:\s*hidden\b/i.test(n.getAttribute('style'))) n.remove();
+    if (HIDDEN_STYLE.test(n.getAttribute('style'))) n.remove();
   });
 }
+function publicNode(node) {
+  // A selected video title/description may itself be hidden or editable, or
+  // live inside a private container. Cloning first would lose those ancestors.
+  for (let ancestor = node; ancestor; ancestor = ancestor.parentElement) {
+    if (ancestor.matches?.(PRIVATE_UI) || HIDDEN_STYLE.test(ancestor.getAttribute?.('style')))
+      return null;
+  }
+  return node;
+}
 const safeText = (node) => {
-  if (!node) return '';
+  if (!publicNode(node)) return '';
   const copy = node.cloneNode(true);
   removePrivateUI(copy);
   return compact(copy.textContent);
@@ -41,9 +49,11 @@ export function extractPage(doc, maxChars = 1800) {
   if (bilibiliVideo || youtubeVideo) {
     // Article extraction on watch pages can promote the long recommendation
     // rail into the "article". Only use the actual video's title/description.
-    const heading = bilibiliVideo
-      ? doc.querySelector('h1.video-title, h1[title], h1')
-      : doc.querySelector('ytd-watch-metadata h1, h1.ytd-watch-metadata, h1');
+    const heading = publicNode(
+      bilibiliVideo
+        ? doc.querySelector('h1.video-title, h1[title], h1')
+        : doc.querySelector('ytd-watch-metadata h1, h1.ytd-watch-metadata, h1')
+    );
     title = (compact(heading?.getAttribute('title')) || safeText(heading) || title).slice(0, 300);
     const details = bilibiliVideo
       ? doc.querySelector('#v_desc') ||

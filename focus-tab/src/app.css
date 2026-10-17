@@ -4,7 +4,7 @@
   --panel: #fff;
   --soft: #f2f4ef;
   --ink: #263c34;
-  --muted: #7a877f;
+  --muted: #626f67;
   --line: #e2e8df;
   --green: #346b53;
   --green-soft: #e7efe6;
@@ -133,7 +133,7 @@ textarea {
 }
 input::placeholder,
 textarea::placeholder {
-  color: #98a39b;
+  color: var(--muted);
 }
 input:disabled {
   background: var(--soft);
@@ -572,6 +572,9 @@ button svg,
   min-height: 0;
 }
 .settings-scroll {
+  min-width: 0;
+  margin: 0;
+  border: 0;
   padding: 23px 34px 30px;
   overflow: auto;
   scrollbar-width: thin;
@@ -693,6 +696,9 @@ button svg,
 .toggle-field input:focus-visible + .switch {
   outline: 2px solid var(--green);
   outline-offset: 4px;
+}
+.toggle-field input:disabled + .switch {
+  opacity: 0.45;
 }
 .settings-footer {
   border-top: 1px solid var(--line);
@@ -1042,6 +1048,15 @@ button svg,
   gap: 12px;
   flex-wrap: wrap;
   margin: 5px 0 15px;
+  max-width: 100%;
+}
+.blocked-navigation {
+  width: 136px;
+  min-height: 46px;
+  padding: 11px 19px;
+  font-size: 14px;
+  font-weight: 500;
+  border-radius: 9px;
 }
 .blocked-page > .fine {
   font-size: 11px;
@@ -1117,8 +1132,10 @@ button svg,
   }
   .settings-shell {
     grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
   }
   .settings-sidebar {
+    min-width: 0;
     padding: 13px 16px 0;
     border-right: 0;
     border-bottom: 1px solid var(--line);
@@ -1186,9 +1203,18 @@ button svg,
   }
   .blocked-actions {
     flex-direction: column;
+    width: min(320px, 100%);
   }
   .blocked-actions > * {
     width: 100%;
+  }
+}
+@media (max-width: 420px) {
+  .form-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .settings-footer {
+    gap: 10px;
   }
 }
 @media (prefers-reduced-motion: reduce) {

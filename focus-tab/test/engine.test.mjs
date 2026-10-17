@@ -266,6 +266,8 @@ test('AI-blocked exact-page pass expires, then human correction can release that
       url: original,
       title: tab.title,
       reason: '不相关',
+      confidence: 0.99,
+      created: f.now(),
       key,
       sessionId: f.engine.session.id,
     },

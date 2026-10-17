@@ -241,6 +241,179 @@ test('a real storage failure is visible inside the settings modal and the draft 
   }
 });
 
+test('saving submits only edited fields and locks the draft until the backend confirms', async () => {
+  const calls = [],
+    state = { config: structuredClone(DEFAULTS), session: null, feedback: [] };
+  let finishSave;
+  const dom = await mount({
+    hash: '#settings',
+    setup(window) {
+      extensionMock(window, state, calls);
+      const send = window.chrome.runtime.sendMessage;
+      window.chrome.runtime.sendMessage = async (message) => {
+        if (message.type !== 'focus:config') return send(message);
+        calls.push(structuredClone(message));
+        await new Promise((resolve) => {
+          finishSave = resolve;
+        });
+        state.config = { ...state.config, ...message.payload };
+        return { ok: true, data: structuredClone(state) };
+      };
+    },
+  });
+  try {
+    const { window } = dom,
+      { document } = window;
+    await until(() => document.querySelector('dialog')?.open);
+    input(window, field(document, '首页标题'), '只保存我的修改');
+    await until(() => !!button(document, '保存设置'));
+    // A newer backend setting has not even reached this window's storage event.
+    state.config.hint = '另一窗口刚刚保存的提示';
+    button(document, '保存设置').click();
+    await until(() => !!finishSave && document.querySelector('.settings-scroll').disabled);
+    assert.equal(field(document, '首页标题').matches(':disabled'), true);
+    input(window, field(document, '首页标题'), '保存期间不接受的输入');
+    document
+      .querySelector('.settings-form')
+      .dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true }));
+    document
+      .querySelector('dialog')
+      .dispatchEvent(new window.Event('cancel', { cancelable: true }));
+    assert.equal(document.querySelector('dialog').open, true);
+    assert.equal(document.querySelector('[aria-label="关闭设置"]').disabled, true);
+    assert.equal(calls.filter((call) => call.type === 'focus:config').length, 1);
+    assert.deepEqual(calls.find((call) => call.type === 'focus:config').payload, {
+      title: '只保存我的修改',
+    });
+    finishSave();
+    await until(() => button(document, '已保存')?.disabled);
+    assert.equal(field(document, '首页标题').value, '只保存我的修改');
+    assert.equal(field(document, '搜索框下方文字').value, '另一窗口刚刚保存的提示');
+    assert.equal(document.querySelector('.settings-scroll').disabled, false);
+  } finally {
+    dom.window.disposeUI();
+    dom.window.close();
+  }
+});
+
+test('external config refresh updates untouched fields and arrays but preserves edits in this window', async () => {
+  const calls = [],
+    state = { config: structuredClone(DEFAULTS), session: null, feedback: [] };
+  const dom = await mount({
+    hash: '#settings',
+    setup(window) {
+      extensionMock(window, state, calls);
+    },
+  });
+  try {
+    const { window } = dom,
+      { document } = window;
+    await until(() => document.querySelector('dialog')?.open);
+    input(window, field(document, '首页标题'), '正在编辑的标题');
+    await until(() => !!button(document, '保存设置'));
+    state.config.title = '另一窗口的标题';
+    state.config.placeholder = '新检索提示';
+    state.config.shortcuts = [];
+    window.testStorageListeners.forEach((listener) =>
+      listener({ focusConfig: { newValue: state.config } })
+    );
+    await until(() => field(document, '搜索框提示').value === '新检索提示');
+    assert.equal(field(document, '首页标题').value, '正在编辑的标题');
+    [...document.querySelectorAll('.settings-sidebar nav button')]
+      .find((el) => el.textContent.endsWith('快捷入口'))
+      .click();
+    await until(() => document.querySelector('.shortcut-editor'));
+    assert.equal(
+      document.querySelectorAll('.shortcut-row').length,
+      0,
+      'external array deletion is preserved'
+    );
+    button(document, '保存设置').click();
+    await until(() => calls.some((call) => call.type === 'focus:config'));
+    assert.deepEqual(calls.find((call) => call.type === 'focus:config').payload, {
+      title: '正在编辑的标题',
+    });
+  } finally {
+    dom.window.disposeUI();
+    dom.window.close();
+  }
+});
+
+test('settings import locks while reading and saves intentional empty arrays', async () => {
+  let finishRead;
+  const dom = await mount({ hash: '#settings/privacy' });
+  try {
+    const { window } = dom,
+      { document } = window;
+    await until(() => document.querySelector('dialog')?.open);
+    const picker = document.querySelector('input[type="file"]');
+    Object.defineProperty(picker, 'files', {
+      value: [
+        {
+          size: 200,
+          text: () =>
+            new Promise((resolve) => {
+              finishRead = resolve;
+            }),
+        },
+      ],
+    });
+    picker.dispatchEvent(new window.Event('change', { bubbles: true }));
+    await until(() => document.querySelector('.settings-scroll').disabled);
+    document
+      .querySelector('dialog')
+      .dispatchEvent(new window.Event('cancel', { cancelable: true }));
+    assert.equal(document.querySelector('dialog').open, true);
+    finishRead(
+      JSON.stringify({
+        format: 'FocusTab',
+        version: 1,
+        config: { title: '导入的标题', shortcuts: [] },
+      })
+    );
+    await until(
+      () => !document.querySelector('.settings-scroll').disabled && !!button(document, '保存设置')
+    );
+    button(document, '保存设置').click();
+    await until(() => button(document, '已保存')?.disabled);
+    const saved = JSON.parse(window.localStorage.getItem('focus-preview-config'));
+    assert.equal(saved.title, '导入的标题');
+    assert.deepEqual(saved.shortcuts, []);
+  } finally {
+    dom.window.disposeUI();
+    dom.window.close();
+  }
+});
+
+test('the analysis host editor retains line breaks while typing and saves normalized domains', async () => {
+  const dom = await mount({ hash: '#settings/ai' });
+  try {
+    const { window } = dom,
+      { document } = window;
+    await until(() => document.querySelector('dialog')?.open);
+    const hosts = field(document, '允许判断的网站');
+    const original = hosts.value;
+    input(window, hosts, original + '\n');
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(
+      hosts.value,
+      original + '\n',
+      'Enter must leave a blank line to type the next host'
+    );
+    input(window, hosts, original + '\n  Example.ORG  \n');
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(hosts.value, original + '\n  Example.ORG  \n');
+    button(document, '保存设置').click();
+    await until(() => button(document, '已保存')?.disabled);
+    const saved = JSON.parse(window.localStorage.getItem('focus-preview-config'));
+    assert.equal(saved.analysisHosts.at(-1), 'example.org');
+    assert.equal(saved.analysisHosts.includes(''), false);
+  } finally {
+    dom.window.disposeUI();
+    dom.window.close();
+  }
+});
+
 test('popup preview settings has a web fallback and page-controlled strings remain text', async () => {
   let opened;
   const dom = await mount({
